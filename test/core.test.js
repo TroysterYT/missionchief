@@ -106,3 +106,61 @@ test('distance and coverage grid', () => {
 test('csv escaping', () => {
   assert.equal(CORE.toCsv([['a', 'b,c', 'say "hi"']]), 'a,"b,c","say ""hi"""');
 });
+
+test('area filter uses rec.inArea', () => {
+  const recs = CORE.buildIndex(buildings, vehicles, staff);
+  recs[0].inArea = true;
+  const f = CORE.mergeDeep(CORE.defaultFilters(), { area: 'in' });
+  assert.equal(CORE.filtersActive(f), true);
+  assert.deepEqual(recs.filter((r) => CORE.matches(r, f)).map((r) => r.id), [1]);
+  f.area = 'out';
+  assert.deepEqual(recs.filter((r) => CORE.matches(r, f)).map((r) => r.id), [2, 3]);
+});
+
+// A 1°×1° square with a 0.5°×0.5° hole in the middle.
+const square = CORE.makeArea('t', 'Test', [[
+  [[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]],
+  [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75], [0.25, 0.25]],
+]]);
+
+test('point in area respects holes and bbox', () => {
+  assert.deepEqual(square.bbox, { west: 0, south: 0, east: 1, north: 1 });
+  assert.equal(CORE.inArea(0.1, 0.1, square), true);
+  assert.equal(CORE.inArea(0.5, 0.5, square), false); // in the hole
+  assert.equal(CORE.inArea(1.5, 0.5, square), false);
+});
+
+test('area size and coverage inside an area', () => {
+  // 1°×1° at the equator ≈ 111.32 × 110.574 km, minus a quarter for the hole.
+  const expected = 111.32 * 110.574 * 0.75;
+  assert.ok(Math.abs(CORE.areaKm2(square) - expected) / expected < 0.01, `got ${CORE.areaKm2(square)}`);
+  const none = CORE.areaCoverage(square, [], 20);
+  assert.equal(none.fraction, 0);
+  assert.equal(none.uncovered.length, none.inside);
+  const all = CORE.areaCoverage(square, [{ lat: 0.5, lng: 0.5, r: 200 }], 20);
+  assert.equal(all.fraction, 1);
+  assert.equal(all.inside, 300); // 400 cells minus the 100 in the hole
+});
+
+test('TopoJSON decoding (quantized, delta-encoded, reversed arcs)', () => {
+  const topo = {
+    transform: { scale: [1, 1], translate: [10, 20] },
+    arcs: [[[0, 0], [2, 0], [0, 2]], [[2, 2], [-2, 0], [0, -2]]],
+    objects: {
+      things: { type: 'GeometryCollection', geometries: [{ type: 'Polygon', arcs: [[0, 1]], id: '42', properties: { name: 'Box' } }] },
+    },
+  };
+  const [f] = CORE.topoFeatures(topo, 'things');
+  assert.equal(f.id, '42');
+  assert.equal(f.name, 'Box');
+  assert.deepEqual(f.polys, [[[[10, 20], [12, 20], [12, 22], [10, 22], [10, 20]]]]);
+  const rev = { ...topo, objects: { t: { type: 'GeometryCollection', geometries: [{ type: 'Polygon', arcs: [[~1, ~0]] }] } } };
+  assert.deepEqual(CORE.topoFeatures(rev, 't')[0].polys[0][0], [[10, 20], [10, 22], [12, 22], [12, 20], [10, 20]]);
+});
+
+test('GeoJSON to polys', () => {
+  const ring = [[0, 0], [1, 0], [1, 1], [0, 0]];
+  assert.deepEqual(CORE.geojsonToPolys({ type: 'Polygon', coordinates: [ring] }), [[ring]]);
+  assert.deepEqual(CORE.geojsonToPolys({ type: 'MultiPolygon', coordinates: [[ring], [ring]] }).length, 2);
+  assert.deepEqual(CORE.geojsonToPolys({ type: 'Point', coordinates: [0, 0] }), []);
+});
