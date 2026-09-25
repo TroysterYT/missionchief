@@ -4,7 +4,7 @@ Userscripts for [MissionChief](https://www.missionchief.com) and its sister game
 
 ## Map Filter & Coverage
 
-`missionchief-map-filter.user.js` adds a filter button (funnel icon) under the zoom buttons on the main map. It opens a panel with five tabs.
+`missionchief-map-filter.user.js` adds a filter button (funnel icon) under the zoom buttons on the main map. It opens a panel with six tabs.
 
 ### Filters
 
@@ -50,6 +50,12 @@ Select areas to outline on the map while you plan where to build:
 Turn the outlines on and off with the map button under the filter button, or **Show on map** on the Areas tab. Hidden areas still count for the area filter, stats and gap shading.
 
 For each selected area you see its size, the buildings inside it by type, the missions in it right now, and the percentage covered by the coverage layer chosen for gap analysis. Selected areas are remembered.
+
+### Sites
+
+Finds real emergency service sites inside your selected areas using OpenStreetMap: fire, ambulance and police stations, hospitals (A&E marked), coastguard and lifeboat stations, air ambulance and police helicopter bases, and mountain and cave rescue. Sites where you already have a building of the matching type nearby (500 m by default) are hidden, so the list shows what's left to build.
+
+Each site shows its address and exact coordinates. **Show** centres the map on the spot and rings it, and **Copy** copies the address. When OpenStreetMap has no address for a site, **Find address** looks up the nearest one; check those against the pin. You can export the list to CSV.
 
 ### Staff
 

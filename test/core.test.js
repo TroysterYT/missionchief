@@ -164,3 +164,68 @@ test('GeoJSON to polys', () => {
   assert.deepEqual(CORE.geojsonToPolys({ type: 'MultiPolygon', coordinates: [[ring], [ring]] }).length, 2);
   assert.deepEqual(CORE.geojsonToPolys({ type: 'Point', coordinates: [0, 0] }), []);
 });
+
+test('sites: parse Overpass elements into categories with addresses', () => {
+  const els = [
+    { type: 'node', id: 1, lat: 50.4, lon: -4.1, tags: { amenity: 'fire_station', name: 'Plymouth Camels Head', 'addr:housenumber': '1', 'addr:street': 'Ferry Road', 'addr:city': 'Plymouth', 'addr:postcode': 'PL2 1AA' } },
+    { type: 'way', id: 2, center: { lat: 50.5, lon: -4.2 }, tags: { emergency: 'ambulance_station' } },
+    { type: 'way', id: 3, center: { lat: 50.6, lon: -4.3 }, tags: { amenity: 'hospital', emergency: 'yes', name: 'Derriford' } },
+    { type: 'node', id: 4, lat: 50.7, lon: -4.4, tags: { shop: 'bakery' } },
+    { type: 'node', id: 5, lat: 50.8, lon: -4.5, tags: { emergency: 'lifeboat_station', name: 'Padstow Lifeboat Station' } },
+    { type: 'node', id: 6, lat: 50.9, lon: -4.6, tags: { aeroway: 'helipad', name: 'Cornwall Air Ambulance' } },
+  ];
+  const all = CORE.SITE_CATS.map((c) => c.key);
+  const sites = CORE.parseSites(els, all);
+  assert.deepEqual(sites.map((s) => s.cat), ['fire', 'ambulance', 'hospital', 'lifeboat', 'air']);
+  assert.equal(sites[0].address, '1 Ferry Road, Plymouth, PL2 1AA');
+  assert.equal(sites[1].name, 'Ambulance station (unnamed)');
+  assert.equal(sites[1].lat, 50.5);
+  assert.equal(sites[2].aande, true);
+  assert.deepEqual(CORE.parseSites(els, ['police']), []);
+});
+
+test('sites: address formatting', () => {
+  assert.equal(CORE.formatAddress({ 'addr:street': 'High Street' }), 'High Street');
+  assert.equal(CORE.formatAddress({ 'addr:city': 'Truro' }), ''); // a town alone isn't a usable address
+  assert.equal(CORE.formatAddress({ 'addr:postcode': 'TR1 1AA' }), 'TR1 1AA');
+  assert.equal(CORE.formatReverse({ house_number: '5', road: 'Station Rd', village: 'Bude', postcode: 'EX23 8AA' }), '5 Station Rd, Bude, EX23 8AA');
+  assert.equal(CORE.formatReverse({ road: 'A30', town: 'Bodmin', postcode: 'PL31' }), 'A30, Bodmin, PL31');
+});
+
+test('sites: duplicates of one station collapse to the better entry', () => {
+  const s = [
+    { cat: 'fire', lat: 50, lng: -4, named: false, address: '' },
+    { cat: 'fire', lat: 50.0003, lng: -4, named: true, address: 'x' }, // ~33 m away
+    { cat: 'police', lat: 50, lng: -4, named: true, address: '' }, // other category stays
+    { cat: 'fire', lat: 50.01, lng: -4, named: true, address: '' }, // ~1.1 km away stays
+  ];
+  const d = CORE.dedupeSites(s);
+  assert.equal(d.length, 3);
+  assert.ok(d.includes(s[1]) && !d.includes(s[0]));
+});
+
+test('sites: already built detection by matching building type', () => {
+  const recs = [
+    { name: 'My Fire Station', type: 0, lat: 50, lng: -4 },
+    { name: 'My Fire Academy', type: 9, lat: 51, lng: -4 },
+  ];
+  const names = { 0: 'Fire Station', 9: 'Fire Academy' };
+  const sites = [
+    { cat: 'fire', lat: 50.002, lng: -4 }, // ~220 m from my station
+    { cat: 'fire', lat: 51, lng: -4 }, // on top of the academy, which doesn't count
+    { cat: 'police', lat: 50, lng: -4 }, // I own no police station, so a fire station here doesn't count
+  ];
+  CORE.markBuilt(sites, recs, (t) => names[t], 500);
+  assert.deepEqual(sites.map((s) => s.built), ['My Fire Station', null, null]);
+  // Type names unavailable: fall back to any building nearby.
+  CORE.markBuilt(sites, recs, () => '', 500);
+  assert.deepEqual(sites.map((s) => s.built), ['My Fire Station', 'My Fire Academy', 'My Fire Station']);
+});
+
+test('sites: overpass query includes only requested categories', () => {
+  const q = CORE.overpassQuery({ south: 49.9, west: -6.4, north: 52.1, east: -1.5 }, ['fire', 'coastguard']);
+  assert.match(q, /"amenity"="fire_station"\]\(49\.9,-6\.4,52\.1,-1\.5\)/);
+  assert.match(q, /coast_guard/);
+  assert.doesNotMatch(q, /hospital/);
+  assert.match(q, /out center tags;$/);
+});

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Map Filter & Coverage
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.3.1
+// @version      0.4.0
 // @description  Filter your buildings on the map by type, extensions, specializations, vehicles, vehicle status, staff training and more; draw station coverage with gap analysis, and select counties or other areas to plan coverage.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -368,6 +368,122 @@
       return { uncovered, fraction: inside ? covered / inside : 0, inside };
     }
 
+    /* ---- real-world sites from OpenStreetMap ---- */
+
+    // type/notType match the game's building type names, to tell whether a site is already built.
+    const SITE_CATS = [
+      { key: 'fire', label: 'Fire stations', color: '#dc2626', match: (t) => t.amenity === 'fire_station', type: /fire/i, notType: /academy|school|training/i },
+      { key: 'ambulance', label: 'Ambulance stations', color: '#16a34a', match: (t) => t.emergency === 'ambulance_station', type: /ambulance/i, notType: /air|academy|school|training/i },
+      { key: 'police', label: 'Police stations', color: '#2563eb', match: (t) => t.amenity === 'police', type: /police/i, notType: /air|aviation|helicopter|academy|school|training/i },
+      { key: 'hospital', label: 'Hospitals', color: '#db2777', match: (t) => t.amenity === 'hospital', type: /hospital/i },
+      { key: 'coastguard', label: 'Coastguard stations', color: '#0891b2', match: (t) => t.emergency === 'coast_guard' || t.amenity === 'coast_guard', type: /coast/i },
+      { key: 'lifeboat', label: 'Lifeboat stations', color: '#ea580c', match: (t) => t.emergency === 'lifeboat_station', type: /lifeboat|rnli|boat/i },
+      { key: 'air', label: 'Air ambulance & police helicopter bases', color: '#7c3aed', match: (t) => /^(helipad|heliport)$/.test(t.aeroway || ''), type: /air|aviation|helicopter/i },
+      { key: 'rescue', label: 'Mountain & cave rescue', color: '#a16207', match: (t) => t.emergency === 'mountain_rescue', type: /rescue/i, notType: /boat|water/i },
+    ];
+
+    /** Overpass QL for the given categories inside bbox {south, west, north, east}. */
+    function overpassQuery(bbox, keys) {
+      const b = `(${bbox.south},${bbox.west},${bbox.north},${bbox.east})`;
+      const parts = {
+        fire: [`nwr["amenity"="fire_station"]${b};`],
+        ambulance: [`nwr["emergency"="ambulance_station"]${b};`],
+        police: [`nwr["amenity"="police"]${b};`],
+        hospital: [`nwr["amenity"="hospital"]${b};`],
+        coastguard: [`nwr["emergency"="coast_guard"]${b};`, `nwr["amenity"="coast_guard"]${b};`],
+        lifeboat: [`nwr["emergency"="lifeboat_station"]${b};`],
+        air: [`nwr["aeroway"~"^(helipad|heliport)$"]["name"~"air ambulance|police|npas",i]${b};`],
+        rescue: [`nwr["emergency"="mountain_rescue"]${b};`],
+      };
+      return `[out:json][timeout:90];(${keys.flatMap((k) => parts[k] || []).join('')});out center tags;`;
+    }
+
+    function joinAddress(parts) {
+      return parts.map((p) => (p === undefined || p === null ? '' : String(p).trim())).filter(Boolean)
+        .filter((p, i, arr) => arr.indexOf(p) === i).join(', ');
+    }
+
+    /** Address from OSM addr:* tags, or '' when there aren't enough to be useful. */
+    function formatAddress(t) {
+      const street = joinAddress([t['addr:housenumber'], t['addr:street']]).replace(', ', ' ');
+      const place = t['addr:city'] || t['addr:town'] || t['addr:village'] || t['addr:suburb'] || t['addr:place'];
+      if (!street && !t['addr:postcode']) return '';
+      return joinAddress([t['addr:housename'], street, place, t['addr:postcode']]);
+    }
+
+    /** Address from a Nominatim reverse-geocoding "address" object. */
+    function formatReverse(a) {
+      if (!a) return '';
+      const street = joinAddress([a.house_number, a.road]).replace(', ', ' ');
+      return joinAddress([street, a.suburb || a.village || a.hamlet, a.town || a.city || a.village, a.postcode]);
+    }
+
+    /** Overpass elements → sites [{id, cat, name, lat, lng, address, aande}], one per element, first matching category. */
+    function parseSites(elements, keys) {
+      const cats = SITE_CATS.filter((c) => keys.includes(c.key));
+      const out = [];
+      for (const el of elements || []) {
+        const t = el.tags || {};
+        const cat = cats.find((c) => c.match(t));
+        if (!cat) continue;
+        const lat = el.lat ?? (el.center && el.center.lat);
+        const lng = el.lon ?? (el.center && el.center.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+        out.push({
+          id: `${el.type}/${el.id}`,
+          cat: cat.key,
+          name: t.name || t.official_name || t.operator || `${cat.label.replace(/s$/, '')} (unnamed)`,
+          named: !!(t.name || t.official_name),
+          lat,
+          lng,
+          address: formatAddress(t),
+          aande: cat.key === 'hospital' && t.emergency === 'yes',
+        });
+      }
+      return out;
+    }
+
+    /** OSM often maps one station twice (a point and a building outline). Keep the better entry within maxM. */
+    function dedupeSites(sites, maxM = 80) {
+      const quality = (s) => (s.named ? 2 : 0) + (s.address ? 1 : 0);
+      const kept = [];
+      for (const s of sites.slice().sort((a, b) => quality(b) - quality(a))) {
+        if (kept.some((k) => k.cat === s.cat && distKm(k.lat, k.lng, s.lat, s.lng) * 1000 <= maxM)) continue;
+        kept.push(s);
+      }
+      return kept;
+    }
+
+    /**
+     * Set site.built to the name of your nearest matching building within maxM metres, or null.
+     * recs: building records; typeName(typeId) gives the game's type name used to match categories.
+     */
+    function markBuilt(sites, recs, typeName, maxM) {
+      // Without building type names (type-name lookup failed) we can't tell types apart, so any building counts.
+      const namesKnown = recs.some((r) => typeName(r.type));
+      const byCat = {};
+      for (const c of SITE_CATS) {
+        byCat[c.key] = !namesKnown ? recs : recs.filter((r) => {
+          const n = typeName(r.type) || '';
+          return c.type.test(n) && !(c.notType && c.notType.test(n));
+        });
+      }
+      for (const s of sites) {
+        const pool = byCat[s.cat];
+        let best = null;
+        let bestD = Infinity;
+        for (const r of pool) {
+          const d = distKm(s.lat, s.lng, r.lat, r.lng) * 1000;
+          if (d < bestD) {
+            bestD = d;
+            best = r;
+          }
+        }
+        s.built = best && bestD <= maxM ? best.name : null;
+      }
+      return sites;
+    }
+
     function toCsv(rows) {
       const esc = (v) => {
         const s = v === null || v === undefined ? '' : String(v);
@@ -392,6 +508,7 @@
       FMS_LABELS, buildIndex, matchChips, matches, filtersActive, defaultFilters, countActive,
       tally, distKm, isCovered, centersNear, gridCoverage, toCsv, mergeDeep, collectSpecs,
       topoFeatures, geojsonToPolys, makeArea, inArea, areaKm2, areaCoverage,
+      SITE_CATS, overpassQuery, formatAddress, formatReverse, parseSites, dedupeSites, markBuilt,
     };
   })();
 
@@ -456,6 +573,10 @@
       clipToAreas: false,
     },
     areas: { visible: true, state: '', ukRegion: 'england', pick: false, color: '#8b5cf6', opacity: 0.1, labels: true, selected: {} },
+    sites: {
+      cats: { fire: 1, ambulance: 1, police: 1, hospital: 1, coastguard: 1, lifeboat: 1, air: 1, rescue: 1 },
+      hideBuilt: true, radius: 500, showOnMap: true,
+    },
     staffScan: { delay: 350, onlyMatched: false, maxAgeHours: 24 },
     presets: {},
     ui: { open: false, tab: 'filters', sections: { types: true } },
@@ -640,6 +761,10 @@
     byId.clear();
     for (const r of index) byId.set(r.id, r);
     apply();
+    if (sites.list.length) {
+      markSitesBuilt();
+      drawSites();
+    }
     renderBody();
   }
 
@@ -1182,6 +1307,146 @@
     };
   }
 
+  /* ---------------- real-world sites (OpenStreetMap) ---------------- */
+
+  const OVERPASS_URLS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  const sites = { list: [], loading: false, error: '', fetchedAt: null };
+  const addrJob = { running: false, abort: false, done: 0, total: 0 };
+  let sitePin = null;
+  const siteCat = (k) => CORE.SITE_CATS.find((c) => c.key === k);
+  const siteKeys = () => Object.keys(cfg.sites.cats).filter((k) => cfg.sites.cats[k] === 1);
+  const visibleSites = () => {
+    const keys = siteKeys();
+    return sites.list.filter((x) => keys.includes(x.cat) && !(cfg.sites.hideBuilt && x.built));
+  };
+
+  async function overpass(query) {
+    let lastErr = null;
+    for (const url of OVERPASS_URLS) {
+      try {
+        const r = await fetch(url, { method: 'POST', body: new URLSearchParams({ data: query }) });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return await r.json();
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw new Error(`OpenStreetMap search failed (${lastErr && lastErr.message}). It may be busy, so try again in a minute.`);
+  }
+
+  function markSitesBuilt() {
+    CORE.markBuilt(sites.list, index, (t) => meta.b[String(t)] || '', Math.max(0, Number(cfg.sites.radius) || 0));
+  }
+
+  async function findSites() {
+    const sel = selectedAreas();
+    const keys = siteKeys();
+    if (!sel.length || !keys.length || sites.loading) return;
+    const bbox = sel.reduce((b, a) => ({
+      south: Math.min(b.south, a.bbox.south), west: Math.min(b.west, a.bbox.west),
+      north: Math.max(b.north, a.bbox.north), east: Math.max(b.east, a.bbox.east),
+    }), { south: Infinity, west: Infinity, north: -Infinity, east: -Infinity });
+    Object.assign(sites, { loading: true, error: '' });
+    if (cfg.ui.tab === 'sites') renderBody();
+    try {
+      const res = await overpass(CORE.overpassQuery(bbox, keys));
+      sites.list = CORE.dedupeSites(CORE.parseSites(res.elements, keys))
+        .map((x) => ({ ...x, area: (sel.find((a) => CORE.inArea(x.lat, x.lng, a)) || {}).name }))
+        .filter((x) => x.area)
+        .sort((a, b) => a.area.localeCompare(b.area) || a.name.localeCompare(b.name));
+      sites.fetchedAt = new Date();
+      markSitesBuilt();
+    } catch (e) {
+      sites.error = e.message;
+    }
+    sites.loading = false;
+    drawSites();
+    if (cfg.ui.tab === 'sites') renderBody();
+  }
+
+  async function lookupAddress(x) {
+    const url = 'https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=en'
+      + `&lat=${x.lat}&lon=${x.lng}`;
+    const j = await nominatim(url);
+    x.address = CORE.formatReverse(j && j.address) || (j && j.display_name) || '';
+    x.nearest = true; // nearest known address to the pin, not one tagged on the station itself
+  }
+
+  async function lookupMissing() {
+    const todo = visibleSites().filter((x) => !x.address && !x.lookupFailed);
+    if (!todo.length || addrJob.running) return;
+    Object.assign(addrJob, { running: true, abort: false, done: 0, total: todo.length });
+    renderBody();
+    for (const x of todo) {
+      if (addrJob.abort) break;
+      try {
+        await lookupAddress(x);
+      } catch (e) {
+        x.lookupFailed = true;
+      }
+      addrJob.done++;
+      const el = document.getElementById('mcmf-addrjob');
+      if (el) el.textContent = `Looking up addresses… ${addrJob.done} / ${addrJob.total}`;
+    }
+    addrJob.running = false;
+    if (cfg.ui.tab === 'sites') renderBody();
+  }
+
+  function copyText(text, btn) {
+    const done = () => {
+      const old = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = old; }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, () => prompt('Copy this:', text));
+    else prompt('Copy this:', text);
+  }
+
+  const coords = (x) => `${x.lat.toFixed(6)}, ${x.lng.toFixed(6)}`;
+
+  function sitePopup(x) {
+    const cat = siteCat(x.cat);
+    const copyBtn = h('button', { class: 'mcmf-btn', onclick: () => copyText(x.address || coords(x), copyBtn) }, 'Copy address');
+    return h('div', { class: 'mcmf-pop' },
+      h('b', null, x.name),
+      h('div', { class: 'mcmf-muted' }, cat.label.replace(/s$/, ''), x.aande ? ' · A&E' : '', ` · ${x.area}`),
+      h('div', { class: 'mcmf-pop-row' }, x.address || 'No address in OpenStreetMap', x.nearest ? ' (nearest address)' : ''),
+      h('div', { class: 'mcmf-pop-row mcmf-muted' }, coords(x)),
+      x.built ? h('div', { class: 'mcmf-pop-row' }, `You have “${x.built}” nearby`) : null,
+      h('div', { class: 'mcmf-pop-row' }, copyBtn));
+  }
+
+  function drawSites() {
+    if (!layers.sites) return;
+    layers.sites.clearLayers();
+    if (!cfg.sites.showOnMap) return;
+    for (const x of visibleSites()) {
+      const c = siteCat(x.cat);
+      L.circleMarker([x.lat, x.lng], {
+        renderer, radius: 6, color: '#fff', weight: 2, fillColor: c.color, fillOpacity: x.built ? 0.35 : 0.95,
+      }).bindPopup(() => sitePopup(x)).addTo(layers.sites);
+    }
+  }
+
+  function showSite(x) {
+    map.setView([x.lat, x.lng], Math.max(map.getZoom(), 16));
+    if (sitePin) sitePin.remove();
+    sitePin = L.circleMarker([x.lat, x.lng], {
+      renderer, radius: 16, color: siteCat(x.cat).color, weight: 4, fill: false,
+    }).bindTooltip(x.name, { permanent: true, direction: 'top', offset: [0, -14] })
+      .on('click', () => { sitePin.remove(); sitePin = null; })
+      .addTo(map);
+  }
+
+  function exportSites() {
+    const rows = [['category', 'name', 'address', 'address_source', 'latitude', 'longitude', 'area', 'a_and_e', 'already_built_nearby', 'osm']];
+    for (const x of visibleSites()) {
+      rows.push([siteCat(x.cat).label, x.name, x.address, x.address ? (x.nearest ? 'nearest address' : 'OpenStreetMap') : '',
+        x.lat.toFixed(6), x.lng.toFixed(6), x.area, x.aande ? 'yes' : '', x.built || '', `https://www.openstreetmap.org/${x.id}`]);
+    }
+    download(`sites-${HOST}-${new Date().toISOString().slice(0, 10)}.csv`, CORE.toCsv(rows), 'text/csv');
+  }
+
   /* ---------------- UI ---------------- */
 
   const CSS = `
@@ -1236,6 +1501,8 @@
   .leaflet-tooltip.mcmf-label{background:rgba(255,255,255,.8);border:0;box-shadow:none;font-weight:600;padding:1px 5px;color:#3b0764}
   .leaflet-tooltip.mcmf-label::before{display:none}
   .mcmf-stat{font-size:12px;color:var(--muted)}
+  .mcmf-site{border-top:1px solid var(--line);padding:6px 0;display:flex;flex-direction:column;gap:2px}
+  .mcmf-site .mcmf-btn{padding:2px 7px;font-size:12px}
   .mcmf-stat b{color:var(--fg)}
   `;
 
@@ -1266,7 +1533,7 @@
     panel = h('div', { id: 'mcmf-panel', class: isDark() ? 'mcmf-dark' : '' });
     panel.hidden = !cfg.ui.open;
     const tabs = h('div', { class: 'mcmf-tabs' });
-    for (const [key, label] of [['filters', 'Filters'], ['coverage', 'Coverage'], ['areas', 'Areas'], ['staff', 'Staff'], ['presets', 'Presets']]) {
+    for (const [key, label] of [['filters', 'Filters'], ['coverage', 'Coverage'], ['areas', 'Areas'], ['sites', 'Sites'], ['staff', 'Staff'], ['presets', 'Presets']]) {
       tabs.append(h('button', {
         class: cfg.ui.tab === key ? 'on' : '',
         'data-tab': key,
@@ -1434,6 +1701,7 @@
     } else if (tab === 'filters') renderFilters();
     else if (tab === 'coverage') renderCoverage();
     else if (tab === 'areas') renderAreas();
+    else if (tab === 'sites') renderSites();
     else if (tab === 'staff') renderStaff();
     else renderPresets();
     bodyEl.scrollTop = scrollTop;
@@ -1861,6 +2129,111 @@
     if (el) el.textContent = lastStats || 'Enable an option above to see stats for the current view.';
   }
 
+  function renderSites() {
+    const cs = cfg.sites;
+    const sel = selectedAreas();
+    const redraw = () => {
+      drawSites();
+      saveCfg();
+      renderBody();
+    };
+    bodyEl.append(h('div', { class: 'mcmf-muted' },
+      'Finds real fire, ambulance and police stations, hospitals and other emergency sites inside your selected areas, using OpenStreetMap, and lists the ones you haven’t built yet with their address.'));
+
+    if (!sel.length) {
+      bodyEl.append(h('div', { class: 'mcmf-card' },
+        h('div', null, 'Select your counties on the Areas tab first.'),
+        h('div', null, h('button', { class: 'mcmf-btn primary', onclick: () => switchTab('areas') }, 'Go to Areas'))));
+      return;
+    }
+
+    const counts = {};
+    for (const x of sites.list) counts[x.cat] = (counts[x.cat] || 0) + 1;
+    bodyEl.append(h('div', { class: 'mcmf-card' },
+      h('div', null, h('b', null, 'Search in: '), sel.map((a) => a.name).join(', ')),
+      chipGroup(CORE.SITE_CATS.map((c) => ({ key: c.key, label: c.label, count: sites.list.length ? counts[c.key] || 0 : undefined })), cs.cats, {
+        tri: false,
+        onChange: () => {
+          drawSites();
+          saveCfg();
+          renderBody();
+        },
+      }),
+      h('label', { class: 'mcmf-row' },
+        h('input', { type: 'checkbox', checked: cs.hideBuilt, onchange: (e) => { cs.hideBuilt = e.target.checked; redraw(); } }),
+        'Hide sites I already have a building within'),
+      h('div', { class: 'mcmf-row' },
+        numInput(cs, 'radius', {
+          min: 0,
+          step: 50,
+          onChange: debounce(() => {
+            markSitesBuilt();
+            redraw();
+          }, 500),
+        }),
+        h('span', { class: 'mcmf-muted' }, 'metres (matching building type)')),
+      h('label', { class: 'mcmf-row' },
+        h('input', { type: 'checkbox', checked: cs.showOnMap, onchange: (e) => { cs.showOnMap = e.target.checked; redraw(); } }),
+        'Show sites on the map'),
+      h('div', { class: 'mcmf-row' },
+        h('button', { class: 'mcmf-btn primary', disabled: sites.loading || !siteKeys().length, onclick: findSites },
+          sites.loading ? 'Searching OpenStreetMap…' : sites.fetchedAt ? 'Search again' : 'Find sites'),
+        sites.fetchedAt ? h('span', { class: 'mcmf-muted' }, `Last search ${sites.fetchedAt.toLocaleTimeString()}`) : null),
+      sites.error ? h('div', { class: 'mcmf-muted mcmf-err' }, sites.error) : null));
+
+    if (!sites.fetchedAt) return;
+
+    const vis = visibleSites();
+    const builtCount = sites.list.filter((x) => siteKeys().includes(x.cat) && x.built).length;
+    const noAddr = vis.filter((x) => !x.address && !x.lookupFailed).length;
+    bodyEl.append(h('div', { class: 'mcmf-card' },
+      h('div', null, h('b', null, vis.filter((x) => !x.built).length), ' sites to build',
+        builtCount ? h('span', { class: 'mcmf-muted' }, ` · ${builtCount} already built${cs.hideBuilt ? ' (hidden)' : ''}`) : null),
+      h('div', { class: 'mcmf-row' },
+        addrJob.running
+          ? [h('span', { id: 'mcmf-addrjob', class: 'mcmf-muted' }, `Looking up addresses… ${addrJob.done} / ${addrJob.total}`),
+            h('button', { class: 'mcmf-btn', onclick: () => { addrJob.abort = true; } }, 'Stop')]
+          : noAddr ? h('button', {
+            class: 'mcmf-btn', title: 'OpenStreetMap allows one lookup per second', onclick: lookupMissing,
+          }, `Look up ${noAddr} missing addresses (~${Math.ceil(noAddr * 1.1)} s)`) : null,
+        h('button', { class: 'mcmf-btn', disabled: !vis.length, onclick: exportSites }, 'Export sites CSV')),
+      h('div', { class: 'mcmf-muted' }, 'Show centres the map on the exact spot and rings it. Addresses marked “nearest” are the closest address to the site, so check the pin.')));
+
+    for (const c of CORE.SITE_CATS) {
+      const items = vis.filter((x) => x.cat === c.key);
+      if (!items.length) continue;
+      if (cfg.ui.sections[`site-${c.key}`] === undefined) cfg.ui.sections[`site-${c.key}`] = true;
+      bodyEl.append(section(`site-${c.key}`, h('span', { style: `color:${c.color}` }, `${c.label} (${items.length})`), null,
+        items.map((x) => {
+          const copyBtn = h('button', { class: 'mcmf-btn', title: 'Copy the address (or coordinates if there is none)', onclick: () => copyText(x.address || coords(x), copyBtn) }, 'Copy');
+          const lookBtn = !x.address && !x.lookupFailed ? h('button', {
+            class: 'mcmf-btn',
+            onclick: async () => {
+              lookBtn.disabled = true;
+              lookBtn.textContent = '…';
+              try {
+                await lookupAddress(x);
+              } catch (e) {
+                x.lookupFailed = true;
+              }
+              renderBody();
+            },
+          }, 'Find address') : null;
+          return h('div', { class: 'mcmf-site' },
+            h('div', { class: 'mcmf-row' },
+              h('b', { style: 'flex:1' }, x.name, x.aande ? h('span', { class: 'mcmf-badge', style: 'margin-left:6px' }, 'A&E') : null),
+              h('button', { class: 'mcmf-btn', onclick: () => showSite(x) }, 'Show'),
+              copyBtn),
+            h('div', { class: 'mcmf-stat' },
+              x.address ? [x.address, x.nearest ? h('i', null, ' (nearest)') : null]
+                : x.lookupFailed ? 'No address found' : 'No address in OpenStreetMap',
+              lookBtn ? [' ', lookBtn] : null),
+            h('div', { class: 'mcmf-stat' }, `${x.area} · ${coords(x)}`,
+              x.built ? h('span', null, ` · you have “${x.built}” nearby`) : null));
+        })));
+    }
+  }
+
   function renderStaff() {
     const s = cfg.staffScan;
     const withStaff = index.filter((r) => r.personnel > 0);
@@ -2019,6 +2392,7 @@
     pane.style.pointerEvents = 'none';
     areaRenderer = L.svg({ pane: 'mcmfAreas', padding: 0.5 });
     layers.areas = L.layerGroup().addTo(map);
+    layers.sites = L.layerGroup().addTo(map);
     for (const [id, a] of Object.entries(store.get('areaGeo', {}))) areaGeo.set(id, CORE.makeArea(id, a.name, a.polys));
     drawAreas();
     if (IS_UK) {
