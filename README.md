@@ -4,7 +4,7 @@ Userscripts for [MissionChief](https://www.missionchief.com) and its sister game
 
 ## Map Filter & Coverage
 
-`missionchief-map-filter.user.js` adds a filter button (funnel icon) under the zoom buttons on the main map. It opens a panel with four tabs.
+`missionchief-map-filter.user.js` adds a filter button (funnel icon) under the zoom buttons on the main map. It opens a panel with five tabs.
 
 ### Filters
 
@@ -19,6 +19,7 @@ Filter your buildings on the map by:
 - **Dispatch center**
 - **Personnel, level and vehicle-count ranges**
 - **Flags**: below personnel goal, hiring active, shared with alliance, small building
+- **Inside or outside your selected areas** (see Areas)
 - **Name or ID search**
 
 Chips cycle through **require → exclude → off**. Right-click a chip to exclude it straight away. Each group can match **any** or **all** of its chips, and all groups must pass together.
@@ -35,6 +36,17 @@ Gap analysis for one layer can:
 - ring missions on the map that fall outside coverage
 
 Coverage uses straight-line distance, not road travel time.
+
+It can also shade gaps across your whole selected areas instead of only the current view, and report how much of those areas is covered.
+
+### Areas
+
+Select areas to outline on the map while you plan where to build:
+
+- **US counties**: choose a state (or use the state in the middle of the map), then tick counties in the list or click them on the map. Boundaries come from the US Census via the `us-atlas` package, accurate to roughly 300 m.
+- **Any other area**: search OpenStreetMap for cities, townships, counties or districts anywhere, for example UK counties on MissionChief UK.
+
+For each selected area you see its size, the buildings inside it by type, the missions in it right now, and the percentage covered by the coverage layer chosen for gap analysis. Selected areas are remembered.
 
 ### Staff
 

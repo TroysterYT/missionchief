@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MissionChief Map Filter & Coverage
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.1.0
-// @description  Filter your buildings on the map by type, extensions, specializations, vehicles, vehicle status, staff training and more, and draw station coverage with gap analysis.
+// @version      0.2.0
+// @description  Filter your buildings on the map by type, extensions, specializations, vehicles, vehicle status, staff training and more; draw station coverage with gap analysis, and select counties or other areas to plan coverage.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
 // @match        https://missionchief.com/*
@@ -143,12 +143,14 @@
         level: { min: null, max: null },
         vehicleCount: { min: null, max: null },
         flags: { allianceShared: 'any', small: 'any', hiring: 'any', understaffed: 'any' },
+        area: 'any',
       };
     }
 
     function filtersActive(f) {
       if (!f) return false;
       if ((f.text || '').trim()) return true;
+      if (f.area && f.area !== 'any') return true;
       if (countActive(f.buildingTypes) || countActive(f.dispatch)) return true;
       for (const g of ['extensions', 'specs', 'vehicles', 'fms', 'trainings']) if (countActive(f[g] && f[g].chips)) return true;
       for (const g of ['personnel', 'level', 'vehicleCount']) if (f[g] && (toNum(f[g].min) !== null || toNum(f[g].max) !== null)) return true;
@@ -182,6 +184,9 @@
       }
 
       if (!matchChips(f.dispatch, 'any', (k) => String(r.dispatch) === k)) return false;
+
+      if (f.area === 'in' && !r.inArea) return false; // r.inArea is set by the caller from the selected areas
+      if (f.area === 'out' && r.inArea) return false;
 
       if (!inRange(r.personnel, f.personnel)) return false;
       if (!inRange(r.level, f.level)) return false;
@@ -250,6 +255,119 @@
       return { uncovered, fraction: n > 0 ? covered / (n * n) : 0 };
     }
 
+    /* ---- areas (counties etc.): polys = [[outerRing, ...holes], ...], rings of [lng, lat] ---- */
+
+    /** Decode one GeometryCollection of a TopoJSON file into [{id, name, polys}]. */
+    function topoFeatures(topo, objectName) {
+      const tf = topo.transform;
+      const arcs = topo.arcs.map((arc) => {
+        let x = 0;
+        let y = 0;
+        return arc.map((p) => {
+          if (!tf) return [p[0], p[1]];
+          x += p[0];
+          y += p[1];
+          return [x * tf.scale[0] + tf.translate[0], y * tf.scale[1] + tf.translate[1]];
+        });
+      });
+      const ring = (idxs) => {
+        const out = [];
+        idxs.forEach((i, k) => {
+          const a = i >= 0 ? arcs[i] : arcs[~i].slice().reverse();
+          for (let j = k ? 1 : 0; j < a.length; j++) out.push(a[j]);
+        });
+        return out;
+      };
+      const polys = (g) => (g.type === 'Polygon' ? [g.arcs.map(ring)]
+        : g.type === 'MultiPolygon' ? g.arcs.map((p) => p.map(ring)) : []);
+      const obj = topo.objects[objectName];
+      return ((obj && obj.geometries) || []).map((g) => ({
+        id: String(g.id),
+        name: (g.properties && g.properties.name) || String(g.id),
+        polys: polys(g),
+      }));
+    }
+
+    function geojsonToPolys(g) {
+      if (!g) return [];
+      if (g.type === 'Feature') return geojsonToPolys(g.geometry);
+      if (g.type === 'Polygon') return [g.coordinates];
+      if (g.type === 'MultiPolygon') return g.coordinates;
+      if (g.type === 'GeometryCollection') return g.geometries.flatMap(geojsonToPolys);
+      return [];
+    }
+
+    function makeArea(id, name, polys) {
+      const bbox = { west: Infinity, south: Infinity, east: -Infinity, north: -Infinity };
+      for (const p of polys) {
+        for (const [x, y] of p[0]) {
+          if (x < bbox.west) bbox.west = x;
+          if (x > bbox.east) bbox.east = x;
+          if (y < bbox.south) bbox.south = y;
+          if (y > bbox.north) bbox.north = y;
+        }
+      }
+      return { id, name, polys, bbox };
+    }
+
+    function inRing(x, y, ring) {
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const [xi, yi] = ring[i];
+        const [xj, yj] = ring[j];
+        if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+      }
+      return inside;
+    }
+
+    function inArea(lat, lng, area) {
+      const b = area.bbox;
+      if (lat < b.south || lat > b.north || lng < b.west || lng > b.east) return false;
+      return area.polys.some((p) => inRing(lng, lat, p[0]) && !p.slice(1).some((hole) => inRing(lng, lat, hole)));
+    }
+
+    function ringAreaKm2(ring) {
+      if (ring.length < 3) return 0;
+      const lat0 = ring.reduce((s, p) => s + p[1], 0) / ring.length;
+      const kx = 111.32 * Math.cos((lat0 * Math.PI) / 180);
+      const ky = 110.574;
+      let sum = 0;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        sum += ring[j][0] * kx * ring[i][1] * ky - ring[i][0] * kx * ring[j][1] * ky;
+      }
+      return Math.abs(sum / 2);
+    }
+
+    function areaKm2(area) {
+      let total = 0;
+      for (const p of area.polys) p.forEach((r, i) => { total += (i ? -1 : 1) * ringAreaKm2(r); });
+      return total;
+    }
+
+    /** Sample an n×n grid over the area's bounding box, counting only cells whose center is inside it. */
+    function areaCoverage(area, centers, n) {
+      const b = area.bbox;
+      const near = centersNear(b, centers);
+      const dLat = (b.north - b.south) / n;
+      const dLng = (b.east - b.west) / n;
+      const uncovered = [];
+      let inside = 0;
+      let covered = 0;
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+          const s = b.south + i * dLat;
+          const w = b.west + j * dLng;
+          const lat = s + dLat / 2;
+          const lng = w + dLng / 2;
+          if (!inArea(lat, lng, area)) continue;
+          inside++;
+          if (isCovered(lat, lng, near)) covered++;
+          else uncovered.push([s, w, s + dLat, w + dLng]);
+        }
+      }
+      return { uncovered, fraction: inside ? covered / inside : 0, inside };
+    }
+
     function toCsv(rows) {
       const esc = (v) => {
         const s = v === null || v === undefined ? '' : String(v);
@@ -273,6 +391,7 @@
     return {
       FMS_LABELS, buildIndex, matchChips, matches, filtersActive, defaultFilters, countActive,
       tally, distKm, isCovered, centersNear, gridCoverage, toCsv, mergeDeep, collectSpecs,
+      topoFeatures, geojsonToPolys, makeArea, inArea, areaKm2, areaCoverage,
     };
   })();
 
@@ -334,7 +453,9 @@
       shadeGaps: false,
       markMissions: false,
       gridSize: 40,
+      clipToAreas: false,
     },
+    areas: { state: '', pick: false, color: '#8b5cf6', opacity: 0.1, labels: true, selected: {} },
     staffScan: { delay: 350, onlyMatched: false, maxAgeHours: 24 },
     presets: {},
     ui: { open: false, tab: 'filters', sections: { types: true } },
@@ -359,6 +480,11 @@
   let renderer = null;
   const layers = {};
   const scan = { running: false, abort: false, done: 0, total: 0, errors: 0 };
+  const areaGeo = new Map(); // area id -> {id, name, polys, bbox}
+  const areaNames = store.get('areaNames', {}); // area id -> label, so chips have names before geometry loads
+  let atlas = null; // {states: [{id, name}], counties: [{id, name, stateId}]}
+  let atlasLoading = null;
+  const IS_US = LOCALES[HOST] === 'en_US';
 
   const typeName = (id) => meta.b[String(id)] || `Building type ${id}`;
   const vehicleName = (id) => meta.v[String(id)] || `Vehicle type ${id}`;
@@ -560,6 +686,8 @@
   /* ---------------- filtering + map ---------------- */
 
   function apply() {
+    const sel = selectedAreas();
+    for (const r of index) r.inArea = sel.some((a) => CORE.inArea(r.lat, r.lng, a));
     const active = CORE.filtersActive(cfg.filters);
     matched = active ? index.filter((r) => CORE.matches(r, cfg.filters)) : index.slice();
     matchedIds = new Set(matched.map((r) => r.id));
@@ -670,13 +798,30 @@
     const parts = [];
     if (c.shadeGaps) {
       const n = Math.min(120, Math.max(10, Number(c.gridSize) || 40));
-      const res = CORE.gridCoverage(bounds, centers, n);
-      for (const [s, w, nn, e] of res.uncovered) {
-        L.rectangle([[s, w], [nn, e]], {
-          renderer, stroke: false, fillColor: '#e11d48', fillOpacity: 0.22, interactive: false,
-        }).addTo(layers.gap);
+      const shade = (cells) => {
+        for (const [s, w, nn, e] of cells) {
+          L.rectangle([[s, w], [nn, e]], {
+            renderer, stroke: false, fillColor: '#e11d48', fillOpacity: 0.22, interactive: false,
+          }).addTo(layers.gap);
+        }
+      };
+      const sel = c.clipToAreas ? selectedAreas() : [];
+      if (sel.length) {
+        let total = 0;
+        let covered = 0;
+        for (const area of sel) {
+          const res = CORE.areaCoverage(area, centers, n);
+          const size = CORE.areaKm2(area); // weight by size: every area gets the same number of samples
+          total += size;
+          covered += res.fraction * size;
+          shade(res.uncovered);
+        }
+        parts.push(`${total ? Math.round((covered / total) * 100) : 0}% of the selected areas is inside “${layer.name}” coverage`);
+      } else {
+        const res = CORE.gridCoverage(bounds, centers, n);
+        shade(res.uncovered);
+        parts.push(`${Math.round(res.fraction * 100)}% of the visible map is inside “${layer.name}” coverage`);
       }
-      parts.push(`${Math.round(res.fraction * 100)}% of the visible map is inside “${layer.name}” coverage`);
     }
     if (c.markMissions) {
       const ms = Array.isArray(window.mission_markers) ? window.mission_markers : [];
@@ -700,6 +845,171 @@
     updateCoverageStats();
   }
 
+  /* ---------------- areas (counties & custom boundaries) ---------------- */
+
+  const ATLAS_URLS = [
+    'https://cdn.jsdelivr.net/npm/us-atlas@3/counties-10m.json',
+    'https://unpkg.com/us-atlas@3/counties-10m.json',
+  ];
+  const STATE_ABBR = {
+    '01': 'AL', '02': 'AK', '04': 'AZ', '05': 'AR', '06': 'CA', '08': 'CO', '09': 'CT', 10: 'DE', 11: 'DC', 12: 'FL',
+    13: 'GA', 15: 'HI', 16: 'ID', 17: 'IL', 18: 'IN', 19: 'IA', 20: 'KS', 21: 'KY', 22: 'LA', 23: 'ME', 24: 'MD',
+    25: 'MA', 26: 'MI', 27: 'MN', 28: 'MS', 29: 'MO', 30: 'MT', 31: 'NE', 32: 'NV', 33: 'NH', 34: 'NJ', 35: 'NM',
+    36: 'NY', 37: 'NC', 38: 'ND', 39: 'OH', 40: 'OK', 41: 'OR', 42: 'PA', 44: 'RI', 45: 'SC', 46: 'SD', 47: 'TN',
+    48: 'TX', 49: 'UT', 50: 'VT', 51: 'VA', 53: 'WA', 54: 'WV', 55: 'WI', 56: 'WY', 72: 'PR',
+  };
+  let areaRenderer = null;
+  let osmResults = [];
+
+  const areaLabel = (id) => (areaGeo.get(id) || {}).name || areaNames[id] || id;
+  const selectedAreas = () => Object.keys(cfg.areas.selected).map((id) => areaGeo.get(id)).filter(Boolean);
+  const areaUnit = () => (cfg.coverage.unit === 'mi' ? ['mi²', 1 / 2.589988] : ['km²', 1]);
+
+  function loadAtlas() {
+    if (atlas) return Promise.resolve(atlas);
+    if (!atlasLoading) {
+      atlasLoading = (async () => {
+        let topo = null;
+        let lastErr = null;
+        for (const u of ATLAS_URLS) {
+          try {
+            const r = await fetch(u);
+            if (!r.ok) throw new Error(`${u}: HTTP ${r.status}`);
+            topo = await r.json();
+            break;
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        if (!topo) throw lastErr;
+        const states = CORE.topoFeatures(topo, 'states');
+        for (const s of states) areaGeo.set(`us-state:${s.id}`, CORE.makeArea(`us-state:${s.id}`, s.name, s.polys));
+        const stateName = Object.fromEntries(states.map((s) => [s.id, s.name]));
+        const counties = CORE.topoFeatures(topo, 'counties').map((c) => {
+          const stateId = c.id.slice(0, 2);
+          const id = `us:${c.id}`;
+          const label = `${c.name}, ${STATE_ABBR[stateId] || stateName[stateId] || stateId}`;
+          areaGeo.set(id, CORE.makeArea(id, label, c.polys));
+          return { id, name: c.name, label, stateId };
+        });
+        atlas = {
+          states: states.map((s) => ({ id: s.id, name: s.name })).sort((x, y) => x.name.localeCompare(y.name)),
+          counties,
+        };
+        return atlas;
+      })();
+      atlasLoading.catch(() => { atlasLoading = null; });
+    }
+    return atlasLoading;
+  }
+
+  function detectState() {
+    if (!atlas) return '';
+    const c = map.getCenter();
+    const s = atlas.states.find((st) => CORE.inArea(c.lat, c.lng, areaGeo.get(`us-state:${st.id}`)));
+    return s ? s.id : '';
+  }
+
+  function saveCustomAreas() {
+    const out = {};
+    for (const id of Object.keys(cfg.areas.selected)) {
+      if (!id.startsWith('osm:')) continue;
+      const a = areaGeo.get(id);
+      if (a) out[id] = { name: a.name, polys: a.polys };
+    }
+    store.set('areaGeo', out);
+    const names = {};
+    for (const id of Object.keys(cfg.areas.selected)) names[id] = areaLabel(id);
+    store.set('areaNames', names);
+  }
+
+  function areasChanged() {
+    saveCustomAreas();
+    drawAreas();
+    apply();
+  }
+
+  function toggleArea(id) {
+    if (cfg.areas.selected[id]) delete cfg.areas.selected[id];
+    else cfg.areas.selected[id] = 1;
+    areasChanged();
+    if (cfg.ui.tab === 'areas') renderBody();
+  }
+
+  const toLatLngs = (polys) => polys.map((p) => p.map((ring) => ring.map(([x, y]) => [y, x])));
+
+  function drawAreas() {
+    if (!layers.areas) return;
+    layers.areas.clearLayers();
+    const a = cfg.areas;
+    // Below coverage/gap shading normally; above it (still below markers) while picking so clicks reach the counties.
+    map.getPane('mcmfAreas').style.zIndex = a.pick ? 450 : 390;
+    const selFill = Math.max(Number(a.opacity) || 0, 0.15);
+    const picked = new Set();
+    if (a.pick && atlas && a.state) {
+      for (const c of atlas.counties) {
+        if (c.stateId !== a.state) continue;
+        picked.add(c.id);
+        const isSel = () => !!a.selected[c.id];
+        const style = () => ({
+          color: a.color, weight: isSel() ? 2.5 : 1, opacity: isSel() ? 0.95 : 0.55, fillColor: a.color, fillOpacity: isSel() ? selFill : 0.03,
+        });
+        const poly = L.polygon(toLatLngs(areaGeo.get(c.id).polys), { renderer: areaRenderer, ...style() });
+        poly.bindTooltip(c.label, { sticky: true });
+        poly.on('mouseover', () => poly.setStyle({ fillOpacity: 0.3 }));
+        poly.on('mouseout', () => poly.setStyle(style()));
+        poly.on('click', (e) => {
+          L.DomEvent.stop(e);
+          toggleArea(c.id);
+        });
+        poly.addTo(layers.areas);
+      }
+    }
+    for (const geo of selectedAreas()) {
+      if (picked.has(geo.id)) continue;
+      const poly = L.polygon(toLatLngs(geo.polys), {
+        renderer: areaRenderer, interactive: false, color: a.color, weight: 2.5, opacity: 0.95, fillColor: a.color, fillOpacity: Number(a.opacity) || 0,
+      });
+      if (a.labels) poly.bindTooltip(geo.name, { permanent: true, direction: 'center', className: 'mcmf-label' });
+      poly.addTo(layers.areas);
+    }
+  }
+
+  async function searchOsm(q) {
+    const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&polygon_geojson=1&polygon_threshold=0.0005'
+      + `&limit=10&accept-language=en&q=${encodeURIComponent(q)}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const list = await r.json();
+    return list
+      .filter((x) => x.geojson && /Polygon/.test(x.geojson.type))
+      .map((x) => ({
+        id: `osm:${x.osm_type}:${x.osm_id}`,
+        name: x.display_name.split(',').slice(0, 2).map((s) => s.trim()).join(', '),
+        full: x.display_name,
+        kind: x.addresstype || x.type || '',
+        polys: CORE.geojsonToPolys(x.geojson),
+      }));
+  }
+
+  function zoomToArea(geo) {
+    const b = geo.bbox;
+    map.fitBounds([[b.south, b.west], [b.north, b.east]], { padding: [20, 20] });
+  }
+
+  function areaStats(geo) {
+    const inside = index.filter((r) => CORE.inArea(r.lat, r.lng, geo));
+    const missions = (Array.isArray(window.mission_markers) ? window.mission_markers : [])
+      .filter((m) => m.getLatLng && CORE.inArea(m.getLatLng().lat, m.getLatLng().lng, geo)).length;
+    const layer = cfg.coverage.layers.find((l) => l.id === cfg.coverage.analysisLayer);
+    const coverage = layer ? CORE.areaCoverage(geo, layerCenters(layer), 50).fraction : null;
+    return {
+      inside, missions, coverage, layer,
+      types: CORE.tally(inside, (r) => [r.type]),
+      size: CORE.areaKm2(geo),
+    };
+  }
+
   /* ---------------- UI ---------------- */
 
   const CSS = `
@@ -719,6 +1029,7 @@
   .mcmf-count{font-weight:600}
   .mcmf-body{overflow:auto;padding:8px 12px 12px;flex:1}
   .mcmf-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  label.mcmf-row{flex-wrap:nowrap}
   .mcmf-muted{color:var(--muted);font-size:12px}
   .mcmf-err{color:var(--exc)}
   .mcmf-input,.mcmf-sel,#mcmf-panel input[type=number]{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit;min-width:0}
@@ -749,6 +1060,10 @@
   .mcmf-pop>a{font-weight:600;font-size:13px}
   .mcmf-pop-row{margin-top:3px}
   .mcmf-ctl a{display:flex!important;align-items:center;justify-content:center}
+  .leaflet-tooltip.mcmf-label{background:rgba(255,255,255,.8);border:0;box-shadow:none;font-weight:600;padding:1px 5px;color:#3b0764}
+  .leaflet-tooltip.mcmf-label::before{display:none}
+  .mcmf-stat{font-size:12px;color:var(--muted)}
+  .mcmf-stat b{color:var(--fg)}
   `;
 
   let panel;
@@ -778,7 +1093,7 @@
     panel = h('div', { id: 'mcmf-panel', class: isDark() ? 'mcmf-dark' : '' });
     panel.hidden = !cfg.ui.open;
     const tabs = h('div', { class: 'mcmf-tabs' });
-    for (const [key, label] of [['filters', 'Filters'], ['coverage', 'Coverage'], ['staff', 'Staff'], ['presets', 'Presets']]) {
+    for (const [key, label] of [['filters', 'Filters'], ['coverage', 'Coverage'], ['areas', 'Areas'], ['staff', 'Staff'], ['presets', 'Presets']]) {
       tabs.append(h('button', {
         class: cfg.ui.tab === key ? 'on' : '',
         'data-tab': key,
@@ -938,14 +1253,17 @@
   function renderBody() {
     if (!bodyEl) return;
     badges.length = 0;
+    const scrollTop = bodyEl.scrollTop;
     bodyEl.replaceChildren();
     const tab = cfg.ui.tab;
-    if (!index.length && tab !== 'presets') {
+    if (!index.length && tab !== 'presets' && tab !== 'areas') {
       bodyEl.append(h('div', { class: 'mcmf-muted' }, 'Loading your buildings… If this stays empty, press Refresh.'));
     } else if (tab === 'filters') renderFilters();
     else if (tab === 'coverage') renderCoverage();
+    else if (tab === 'areas') renderAreas();
     else if (tab === 'staff') renderStaff();
     else renderPresets();
+    bodyEl.scrollTop = scrollTop;
     updateSummary();
   }
 
@@ -996,7 +1314,7 @@
       section('nums', 'Numbers & flags', () => {
         let n = 0;
         for (const g of [f.personnel, f.level, f.vehicleCount]) if (g.min !== null || g.max !== null) n++;
-        return n + Object.values(f.flags).filter((v) => v !== 'any').length;
+        return n + Object.values(f.flags).filter((v) => v !== 'any').length + (f.area !== 'any' ? 1 : 0);
       },
       h('div', { class: 'mcmf-grid2' },
         range('Personnel', f.personnel),
@@ -1005,7 +1323,9 @@
         flagSel('Below personnel goal', 'understaffed'),
         flagSel('Hiring active', 'hiring'),
         flagSel('Shared with alliance', 'allianceShared'),
-        flagSel('Small building', 'small'))),
+        flagSel('Small building', 'small'),
+        h('span', null, 'In selected areas'),
+        select(f, 'area', [['any', 'Any'], ['in', 'Inside'], ['out', 'Outside']], applySoon))),
     );
   }
 
@@ -1117,10 +1437,182 @@
         h('label', { class: 'mcmf-row' },
           h('input', { type: 'checkbox', checked: c.markMissions, onchange: (e) => { c.markMissions = e.target.checked; redraw(); } }),
           'Ring missions outside coverage'),
+        h('label', { class: 'mcmf-row' },
+          h('input', { type: 'checkbox', checked: c.clipToAreas, onchange: (e) => { c.clipToAreas = e.target.checked; redraw(); } }),
+          'Shade whole selected areas, not just the view'),
         h('div', { class: 'mcmf-row mcmf-muted' }, 'Grid detail', numInput(c, 'gridSize', { min: 10, onChange: redraw }), 'cells per side'),
         h('div', { id: 'mcmf-covstats', class: 'mcmf-muted' })) : null,
     );
     updateCoverageStats();
+  }
+
+  function renderAreas() {
+    const a = cfg.areas;
+    const [unitLabel, unitMul] = areaUnit();
+    const fmt = (n) => Math.round(n).toLocaleString();
+
+    bodyEl.append(h('div', { class: 'mcmf-muted' },
+      'Select counties or other areas to outline them on the map, see what’s inside them, filter buildings to them (Filters → Numbers & flags) and measure coverage inside them.'));
+
+    // US counties
+    const us = h('div', { class: 'mcmf-card' }, h('b', null, 'US counties'));
+    if (!atlas) {
+      const msg = h('div', { class: 'mcmf-muted' }, 'Loading county boundaries…');
+      us.append(msg);
+      loadAtlas().then(() => {
+        if (!a.state) a.state = detectState();
+        drawAreas();
+        saveCfg();
+        if (cfg.ui.tab === 'areas') renderBody();
+      }).catch((e) => {
+        msg.textContent = `Could not load county boundaries: ${e.message}`;
+        msg.classList.add('mcmf-err');
+      });
+    } else {
+      const counties = atlas.counties.filter((c) => c.stateId === a.state);
+      const refresh = () => {
+        areasChanged();
+        renderBody();
+      };
+      us.append(
+        h('div', { class: 'mcmf-row' },
+          select(a, 'state', [['', 'Choose a state…'], ...atlas.states.map((s) => [s.id, s.name])], () => {
+            drawAreas();
+            saveCfg();
+            renderBody();
+          }),
+          h('button', {
+            class: 'mcmf-btn', title: 'Pick the state in the middle of the map',
+            onclick: () => {
+              a.state = detectState();
+              drawAreas();
+              saveCfg();
+              renderBody();
+            },
+          }, 'Use map center'),
+          a.state ? h('button', { class: 'mcmf-btn', onclick: () => zoomToArea(areaGeo.get(`us-state:${a.state}`)) }, 'Zoom') : null),
+        h('label', { class: 'mcmf-row' },
+          h('input', {
+            type: 'checkbox', checked: a.pick,
+            onchange: (e) => {
+              a.pick = e.target.checked;
+              drawAreas();
+              saveCfg();
+            },
+          }),
+          'Click counties on the map to select them'),
+        a.state ? h('div', { class: 'mcmf-row' },
+          h('span', { class: 'mcmf-muted', style: 'flex:1' }, `${counties.length} counties · ${counties.filter((c) => a.selected[c.id]).length} selected`),
+          h('button', { class: 'mcmf-btn', onclick: () => { for (const c of counties) a.selected[c.id] = 1; refresh(); } }, 'All'),
+          h('button', { class: 'mcmf-btn', onclick: () => { for (const c of counties) delete a.selected[c.id]; refresh(); } }, 'None')) : null,
+        a.state ? chipGroup(counties.map((c) => ({ key: c.id, label: c.name })), a.selected, { tri: false, onChange: refresh }) : null,
+      );
+    }
+    if (IS_US || atlas) bodyEl.append(us);
+
+    // Any area via OpenStreetMap
+    const q = { v: '' };
+    const results = h('div', { class: 'mcmf-sec' });
+    const status = h('div', { class: 'mcmf-muted' });
+    const showResults = () => {
+      results.replaceChildren(...osmResults.map((r) => h('div', { class: 'mcmf-row' },
+        h('span', { style: 'flex:1', title: r.full }, r.name, ' ', h('span', { class: 'mcmf-muted' }, r.kind)),
+        a.selected[r.id] ? h('span', { class: 'mcmf-muted' }, 'added')
+          : h('button', {
+            class: 'mcmf-btn',
+            onclick: () => {
+              areaGeo.set(r.id, CORE.makeArea(r.id, r.name, r.polys));
+              a.selected[r.id] = 1;
+              areasChanged();
+              zoomToArea(areaGeo.get(r.id));
+              renderBody();
+            },
+          }, 'Add'))));
+    };
+    const doSearch = async () => {
+      if (!q.v) return;
+      status.textContent = 'Searching…';
+      try {
+        osmResults = await searchOsm(q.v);
+        status.textContent = osmResults.length ? '' : 'No areas with a boundary found. Try adding the state or country.';
+      } catch (e) {
+        status.textContent = `Search failed: ${e.message}`;
+      }
+      showResults();
+    };
+    showResults();
+    bodyEl.append(h('div', { class: 'mcmf-card' },
+      h('b', null, IS_US ? 'Any other area' : 'Find an area'),
+      h('div', { class: 'mcmf-muted' }, 'Cities, townships, counties, districts… anywhere, from OpenStreetMap.'),
+      h('div', { class: 'mcmf-row' },
+        h('input', {
+          type: 'search', class: 'mcmf-input', style: 'flex:1;width:auto', placeholder: IS_US ? 'e.g. Pittsburgh, PA' : 'e.g. Kent, England',
+          oninput: (e) => { q.v = e.target.value.trim(); },
+          onkeydown: (e) => { if (e.key === 'Enter') doSearch(); },
+        }),
+        h('button', { class: 'mcmf-btn', onclick: doSearch }, 'Search')),
+      status, results));
+
+    // Selected areas
+    const sel = Object.keys(a.selected);
+    const list = h('div', { class: 'mcmf-card' },
+      h('div', { class: 'mcmf-row' },
+        h('b', { style: 'flex:1' }, `Selected areas (${sel.length})`),
+        h('input', { type: 'color', value: a.color, title: 'Outline color', style: 'width:28px;height:22px;padding:0;border:0;background:none', oninput: (e) => { a.color = e.target.value; drawAreas(); saveCfg(); } }),
+        sel.length ? h('button', {
+          class: 'mcmf-btn',
+          onclick: () => {
+            if (!confirm('Remove all selected areas?')) return;
+            a.selected = {};
+            areasChanged();
+            renderBody();
+          },
+        }, 'Clear') : null),
+      h('div', { class: 'mcmf-row mcmf-muted' },
+        'Fill', h('input', { type: 'range', min: 0, max: 0.5, step: 0.02, value: a.opacity, oninput: (e) => { a.opacity = Number(e.target.value); drawAreas(); saveCfg(); } }),
+        h('label', { class: 'mcmf-row' },
+          h('input', { type: 'checkbox', checked: a.labels, onchange: (e) => { a.labels = e.target.checked; drawAreas(); saveCfg(); } }), 'Labels')));
+    if (!sel.length) list.append(h('div', { class: 'mcmf-muted' }, 'Nothing selected yet.'));
+    let totals = { size: 0, missions: 0 };
+    const uniqueBuildings = new Set();
+    for (const id of sel) {
+      const geo = areaGeo.get(id);
+      const remove = h('button', {
+        class: 'mcmf-btn', title: 'Remove',
+        onclick: () => {
+          delete a.selected[id];
+          areasChanged();
+          renderBody();
+        },
+      }, '✕');
+      if (!geo) {
+        list.append(h('div', { class: 'mcmf-row' }, h('span', { style: 'flex:1' }, areaLabel(id), h('span', { class: 'mcmf-muted' }, ' · loading…')), remove));
+        continue;
+      }
+      const st = areaStats(geo);
+      totals = { size: totals.size + st.size, missions: totals.missions + st.missions };
+      for (const r of st.inside) uniqueBuildings.add(r.id);
+      list.append(h('div', { style: 'border-top:1px solid var(--line);padding-top:6px' },
+        h('div', { class: 'mcmf-row' },
+          h('b', { style: 'flex:1' }, geo.name),
+          h('button', { class: 'mcmf-btn', onclick: () => zoomToArea(geo) }, 'Zoom'),
+          remove),
+        h('div', { class: 'mcmf-stat' },
+          h('b', null, fmt(st.size * unitMul)), ` ${unitLabel} · `,
+          h('b', null, st.inside.length), ' buildings · ',
+          h('b', null, st.missions), ' missions now',
+          st.coverage !== null ? [' · ', h('b', null, `${Math.round(st.coverage * 100)}%`), ` covered by “${st.layer.name}”`] : null),
+        st.types.length ? h('div', { class: 'mcmf-stat' }, st.types.map(([t, n]) => `${n}× ${typeName(t)}`).join(', ')) : null));
+    }
+    if (sel.length > 1) {
+      list.append(h('div', { class: 'mcmf-stat', style: 'border-top:1px solid var(--line);padding-top:6px' },
+        'Total: ', h('b', null, fmt(totals.size * unitMul)), ` ${unitLabel} · `, h('b', null, uniqueBuildings.size), ' buildings · ',
+        h('b', null, totals.missions), ' missions now'));
+    }
+    if (sel.length && !cfg.coverage.layers.length) {
+      list.append(h('div', { class: 'mcmf-muted' }, 'Add a coverage layer on the Coverage tab to see how much of each area your stations cover.'));
+    }
+    bodyEl.append(list);
   }
 
   function updateCoverageStats() {
@@ -1282,6 +1774,19 @@
     layers.gap = L.layerGroup().addTo(map);
     layers.miss = L.layerGroup().addTo(map);
     layers.hl = L.layerGroup().addTo(map);
+    const pane = map.createPane('mcmfAreas');
+    pane.style.pointerEvents = 'none';
+    areaRenderer = L.svg({ pane: 'mcmfAreas', padding: 0.5 });
+    layers.areas = L.layerGroup().addTo(map);
+    for (const [id, a] of Object.entries(store.get('areaGeo', {}))) areaGeo.set(id, CORE.makeArea(id, a.name, a.polys));
+    drawAreas();
+    if (Object.keys(cfg.areas.selected).some((id) => id.startsWith('us:'))) {
+      loadAtlas().then(() => {
+        drawAreas();
+        apply();
+        if (cfg.ui.tab === 'areas') renderBody();
+      }).catch((e) => console.warn('[MCMF] could not load county boundaries', e));
+    }
 
     const Ctl = L.Control.extend({
       options: { position: 'topleft' },
