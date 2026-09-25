@@ -47,6 +47,8 @@ Select areas to outline on the map while you plan where to build:
 - **UK counties** (MissionChief UK): England's 48 ceremonial counties, Wales's 22 principal areas, Scotland's 32 council areas and Northern Ireland's 6 counties. Tick them in the list or click them on the map. Boundaries come from OpenStreetMap: each one downloads the first time you select it, and the whole list downloads in about a minute if you want to click counties on the map. They are then saved in your browser.
 - **Any other area**: search OpenStreetMap for cities, townships, counties or districts anywhere, for example UK counties on MissionChief UK.
 
+Turn the outlines on and off with the map button under the filter button, or **Show on map** on the Areas tab. Hidden areas still count for the area filter, stats and gap shading.
+
 For each selected area you see its size, the buildings inside it by type, the missions in it right now, and the percentage covered by the coverage layer chosen for gap analysis. Selected areas are remembered.
 
 ### Staff

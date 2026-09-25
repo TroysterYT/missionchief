@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Map Filter & Coverage
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.3.0
+// @version      0.3.1
 // @description  Filter your buildings on the map by type, extensions, specializations, vehicles, vehicle status, staff training and more; draw station coverage with gap analysis, and select counties or other areas to plan coverage.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -455,7 +455,7 @@
       gridSize: 40,
       clipToAreas: false,
     },
-    areas: { state: '', ukRegion: 'england', pick: false, color: '#8b5cf6', opacity: 0.1, labels: true, selected: {} },
+    areas: { visible: true, state: '', ukRegion: 'england', pick: false, color: '#8b5cf6', opacity: 0.1, labels: true, selected: {} },
     staffScan: { delay: 350, onlyMatched: false, maxAgeHours: 24 },
     presets: {},
     ui: { open: false, tab: 'filters', sections: { types: true } },
@@ -465,8 +465,15 @@
   let saveTimer = null;
   const saveCfg = () => {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => store.set('config', cfg), 300);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      store.set('config', cfg);
+    }, 300);
   };
+  // Don't lose a change made just before leaving or reloading the page.
+  window.addEventListener('pagehide', () => {
+    if (saveTimer) store.set('config', cfg);
+  });
 
   let data = { buildings: [], vehicles: [] };
   let index = [];
@@ -930,6 +937,22 @@
     apply();
   }
 
+  /** Show or hide the area outlines. Filters, stats and gap shading still use the selected areas. */
+  function setAreasVisible(v) {
+    cfg.areas.visible = v;
+    if (!v) cfg.areas.pick = false;
+    drawAreas();
+    saveCfg();
+    if (cfg.ui.tab === 'areas') renderBody();
+  }
+
+  let areasBtn = null;
+  function updateAreasButton() {
+    if (!areasBtn) return;
+    areasBtn.classList.toggle('mcmf-on', !!cfg.areas.visible);
+    areasBtn.title = cfg.areas.visible ? 'Hide county outlines' : 'Show county outlines';
+  }
+
   function toggleArea(id) {
     if (cfg.areas.selected[id]) delete cfg.areas.selected[id];
     else cfg.areas.selected[id] = 1;
@@ -945,6 +968,8 @@
     const a = cfg.areas;
     // Below coverage/gap shading normally; above it (still below markers) while picking so clicks reach the counties.
     map.getPane('mcmfAreas').style.zIndex = a.pick ? 450 : 390;
+    updateAreasButton();
+    if (!a.visible) return;
     const selFill = Math.max(Number(a.opacity) || 0, 0.15);
     const picked = new Set();
     if (a.pick) {
@@ -1206,7 +1231,8 @@
   .mcmf-pop{font-size:12px;max-width:280px}
   .mcmf-pop>a{font-weight:600;font-size:13px}
   .mcmf-pop-row{margin-top:3px}
-  .mcmf-ctl a{display:flex!important;align-items:center;justify-content:center}
+  .mcmf-ctl a{display:flex!important;align-items:center;justify-content:center;color:#9ca3af}
+  .mcmf-ctl a:first-child,.mcmf-ctl a.mcmf-on{color:#6d28d9}
   .leaflet-tooltip.mcmf-label{background:rgba(255,255,255,.8);border:0;box-shadow:none;font-weight:600;padding:1px 5px;color:#3b0764}
   .leaflet-tooltip.mcmf-label::before{display:none}
   .mcmf-stat{font-size:12px;color:var(--muted)}
@@ -1636,6 +1662,7 @@
             type: 'checkbox', checked: a.pick,
             onchange: (e) => {
               a.pick = e.target.checked;
+              if (a.pick) a.visible = true;
               drawAreas();
               saveCfg();
             },
@@ -1674,6 +1701,7 @@
           type: 'checkbox', checked: a.pick,
           onchange: (e) => {
             a.pick = e.target.checked;
+            if (a.pick) a.visible = true;
             drawAreas();
             saveCfg();
             renderBody();
@@ -1769,6 +1797,8 @@
     const list = h('div', { class: 'mcmf-card' },
       h('div', { class: 'mcmf-row' },
         h('b', { style: 'flex:1' }, `Selected areas (${sel.length})`),
+        h('label', { class: 'mcmf-row', title: 'Also on the map button under the filter button' },
+          h('input', { type: 'checkbox', checked: a.visible, onchange: (e) => setAreasVisible(e.target.checked) }), 'Show on map'),
         h('input', { type: 'color', value: a.color, title: 'Outline color', style: 'width:28px;height:22px;padding:0;border:0;background:none', oninput: (e) => { a.color = e.target.value; drawAreas(); saveCfg(); } }),
         sel.length ? h('button', {
           class: 'mcmf-btn',
@@ -2022,6 +2052,14 @@
           L.DomEvent.preventDefault(e);
           togglePanel();
         });
+        areasBtn = L.DomUtil.create('a', '', d);
+        areasBtn.href = '#';
+        areasBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><path d="M4 6l5-2 6 3 5-2v13l-5 2-6-3-5 2z"/><path d="M9 4v13M15 7v13"/></svg>';
+        L.DomEvent.on(areasBtn, 'click', (e) => {
+          L.DomEvent.preventDefault(e);
+          setAreasVisible(!cfg.areas.visible);
+        });
+        updateAreasButton();
         L.DomEvent.disableClickPropagation(d);
         return d;
       },
