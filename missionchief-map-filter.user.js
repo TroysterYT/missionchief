@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Map Filter & Coverage
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.2.0
+// @version      0.3.0
 // @description  Filter your buildings on the map by type, extensions, specializations, vehicles, vehicle status, staff training and more; draw station coverage with gap analysis, and select counties or other areas to plan coverage.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -455,7 +455,7 @@
       gridSize: 40,
       clipToAreas: false,
     },
-    areas: { state: '', pick: false, color: '#8b5cf6', opacity: 0.1, labels: true, selected: {} },
+    areas: { state: '', ukRegion: 'england', pick: false, color: '#8b5cf6', opacity: 0.1, labels: true, selected: {} },
     staffScan: { delay: 350, onlyMatched: false, maxAgeHours: 24 },
     presets: {},
     ui: { open: false, tab: 'filters', sections: { types: true } },
@@ -485,6 +485,7 @@
   let atlas = null; // {states: [{id, name}], counties: [{id, name, stateId}]}
   let atlasLoading = null;
   const IS_US = LOCALES[HOST] === 'en_US';
+  const IS_UK = LOCALES[HOST] === 'en_GB';
 
   const typeName = (id) => meta.b[String(id)] || `Building type ${id}`;
   const vehicleName = (id) => meta.v[String(id)] || `Vehicle type ${id}`;
@@ -946,9 +947,8 @@
     map.getPane('mcmfAreas').style.zIndex = a.pick ? 450 : 390;
     const selFill = Math.max(Number(a.opacity) || 0, 0.15);
     const picked = new Set();
-    if (a.pick && atlas && a.state) {
-      for (const c of atlas.counties) {
-        if (c.stateId !== a.state) continue;
+    if (a.pick) {
+      for (const c of pickItems()) {
         picked.add(c.id);
         const isSel = () => !!a.selected[c.id];
         const style = () => ({
@@ -975,12 +975,159 @@
     }
   }
 
+  /* ---- UK counties: fixed lists, boundaries fetched from OpenStreetMap on demand and cached ---- */
+
+  // [label, search text (defaults to label)]
+  const UK_REGIONS = {
+    england: {
+      title: 'England – ceremonial counties', nation: 'England', prefer: 'ceremonial',
+      items: ['Bedfordshire', 'Berkshire', ['Bristol', 'City of Bristol'], 'Buckinghamshire', 'Cambridgeshire', 'Cheshire',
+        'City of London', 'Cornwall', 'Cumbria', 'Derbyshire', 'Devon', 'Dorset', ['Durham', 'County Durham'],
+        'East Riding of Yorkshire', 'East Sussex', 'Essex', 'Gloucestershire', 'Greater London', 'Greater Manchester',
+        'Hampshire', 'Herefordshire', 'Hertfordshire', 'Isle of Wight', 'Kent', 'Lancashire', 'Leicestershire',
+        'Lincolnshire', 'Merseyside', 'Norfolk', 'North Yorkshire', 'Northamptonshire', 'Northumberland',
+        'Nottinghamshire', 'Oxfordshire', 'Rutland', 'Shropshire', 'Somerset', 'South Yorkshire', 'Staffordshire',
+        'Suffolk', 'Surrey', 'Tyne and Wear', 'Warwickshire', 'West Midlands', 'West Sussex', 'West Yorkshire',
+        'Wiltshire', 'Worcestershire'],
+    },
+    wales: {
+      title: 'Wales – principal areas', nation: 'Wales', prefer: 'administrative',
+      items: ['Blaenau Gwent', ['Bridgend', 'Bridgend County Borough'], ['Caerphilly', 'Caerphilly County Borough'], 'Cardiff',
+        'Carmarthenshire', 'Ceredigion', ['Conwy', 'Conwy County Borough'], 'Denbighshire', 'Flintshire', 'Gwynedd',
+        'Isle of Anglesey', ['Merthyr Tydfil', 'Merthyr Tydfil County Borough'], 'Monmouthshire', 'Neath Port Talbot',
+        ['Newport', 'City of Newport'], 'Pembrokeshire', 'Powys', 'Rhondda Cynon Taf', ['Swansea', 'City and County of Swansea'],
+        'Torfaen', 'Vale of Glamorgan', ['Wrexham', 'Wrexham County Borough']],
+    },
+    scotland: {
+      title: 'Scotland – council areas', nation: 'Scotland', prefer: 'administrative',
+      items: ['Aberdeen City', 'Aberdeenshire', 'Angus', 'Argyll and Bute', 'City of Edinburgh', 'Clackmannanshire',
+        'Dumfries and Galloway', 'Dundee City', 'East Ayrshire', 'East Dunbartonshire', 'East Lothian', 'East Renfrewshire',
+        'Falkirk', 'Fife', 'Glasgow City', 'Highland', 'Inverclyde', 'Midlothian', 'Moray', 'Na h-Eileanan Siar',
+        'North Ayrshire', 'North Lanarkshire', 'Orkney Islands', 'Perth and Kinross', 'Renfrewshire', 'Scottish Borders',
+        'Shetland Islands', 'South Ayrshire', 'South Lanarkshire', 'Stirling', 'West Dunbartonshire', 'West Lothian'],
+    },
+    ni: {
+      title: 'Northern Ireland – counties', nation: 'Northern Ireland', prefer: 'ceremonial',
+      items: [['Antrim', 'County Antrim'], ['Armagh', 'County Armagh'], ['Down', 'County Down'], ['Fermanagh', 'County Fermanagh'],
+        ['Londonderry', 'County Londonderry'], ['Tyrone', 'County Tyrone']],
+    },
+  };
+  const slug = (t) => t.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+
+  function ukList(region) {
+    const r = UK_REGIONS[region];
+    if (!r) return [];
+    return r.items.map((it) => {
+      const [label, query] = Array.isArray(it) ? it : [it, it];
+      return { id: `uk:${region}:${slug(label)}`, label, query, region };
+    });
+  }
+
+  /** Items shown as clickable outlines in pick mode (only those whose boundary is loaded). */
+  function pickItems() {
+    const a = cfg.areas;
+    if (IS_UK) return ukList(a.ukRegion).filter((c) => areaGeo.has(c.id));
+    if (atlas && a.state) return atlas.counties.filter((c) => c.stateId === a.state);
+    return [];
+  }
+
+  // OpenStreetMap's Nominatim allows at most one request per second, so all calls go through this queue.
+  let nominatimChain = Promise.resolve();
+  function nominatim(url) {
+    const run = nominatimChain.then(async () => {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`OpenStreetMap search: HTTP ${r.status}`);
+      return r.json();
+    });
+    nominatimChain = run.catch(() => {}).then(() => sleep(1100));
+    return run;
+  }
+
+  // Boundary cache in IndexedDB (too big for localStorage, which the game and other scripts share).
+  const areaDb = (() => {
+    let dbp = null;
+    const open = () => dbp || (dbp = new Promise((resolve, reject) => {
+      const req = indexedDB.open('mcmf-areas', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('areas', { keyPath: 'id' });
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    }));
+    const run = async (mode, fn) => {
+      const db = await open();
+      return new Promise((resolve, reject) => {
+        const t = db.transaction('areas', mode);
+        const req = fn(t.objectStore('areas'));
+        t.oncomplete = () => resolve(req.result);
+        t.onerror = () => reject(t.error);
+      });
+    };
+    return {
+      all: () => run('readonly', (st) => st.getAll()).catch(() => []),
+      put: (v) => run('readwrite', (st) => st.put(v)).catch((e) => console.warn('[MCMF] could not cache boundary', e)),
+      clear: () => run('readwrite', (st) => st.clear()).catch(() => {}),
+    };
+  })();
+
+  const ukPending = new Map();
+  /** Load one UK county boundary: memory → IndexedDB (preloaded at boot) → OpenStreetMap. */
+  function ensureUkArea(item) {
+    if (areaGeo.has(item.id)) return Promise.resolve(areaGeo.get(item.id));
+    if (ukPending.has(item.id)) return ukPending.get(item.id);
+    const reg = UK_REGIONS[item.region];
+    const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&polygon_geojson=1&polygon_threshold=0.002'
+      + `&countrycodes=gb&limit=8&accept-language=en&q=${encodeURIComponent(`${item.query}, ${reg.nation}`)}`;
+    const p = nominatim(url).then((list) => {
+      const want = item.label.toLowerCase();
+      const scored = list
+        .filter((x) => x.geojson && /Polygon/.test(x.geojson.type))
+        .map((x) => {
+          const cls = x.category || x.class;
+          const name = String(x.name || '').toLowerCase();
+          let score = 0;
+          if (cls === 'boundary') score += 4;
+          if (x.type === reg.prefer) score += 2;
+          if (name === want || name === item.query.toLowerCase()) score += 3;
+          else if (name.includes(want)) score += 1;
+          return { x, score };
+        })
+        .sort((a, b) => b.score - a.score);
+      if (!scored.length) throw new Error(`no boundary found for ${item.label}`);
+      const area = CORE.makeArea(item.id, item.label, CORE.geojsonToPolys(scored[0].x.geojson));
+      areaGeo.set(item.id, area);
+      areaDb.put({ id: item.id, name: item.label, polys: area.polys });
+      return area;
+    }).finally(() => ukPending.delete(item.id));
+    ukPending.set(item.id, p);
+    return p;
+  }
+
+  const ukLoad = { running: false, done: 0, total: 0, failed: [] };
+  async function loadUkItems(items) {
+    const todo = items.filter((c) => !areaGeo.has(c.id));
+    if (!todo.length || ukLoad.running) return;
+    Object.assign(ukLoad, { running: true, done: 0, total: todo.length, failed: [] });
+    if (cfg.ui.tab === 'areas') renderBody();
+    for (const c of todo) {
+      try {
+        await ensureUkArea(c);
+      } catch (e) {
+        ukLoad.failed.push(c.label);
+        delete cfg.areas.selected[c.id];
+      }
+      ukLoad.done++;
+      const el = document.getElementById('mcmf-ukload');
+      if (el) el.textContent = `Loading boundaries… ${ukLoad.done} / ${ukLoad.total}`;
+      drawAreas();
+    }
+    ukLoad.running = false;
+    areasChanged();
+    if (cfg.ui.tab === 'areas') renderBody();
+  }
+
   async function searchOsm(q) {
     const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&polygon_geojson=1&polygon_threshold=0.0005'
       + `&limit=10&accept-language=en&q=${encodeURIComponent(q)}`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const list = await r.json();
+    const list = await nominatim(url);
     return list
       .filter((x) => x.geojson && /Polygon/.test(x.geojson.type))
       .map((x) => ({
@@ -1446,15 +1593,8 @@
     updateCoverageStats();
   }
 
-  function renderAreas() {
+  function usCountiesCard() {
     const a = cfg.areas;
-    const [unitLabel, unitMul] = areaUnit();
-    const fmt = (n) => Math.round(n).toLocaleString();
-
-    bodyEl.append(h('div', { class: 'mcmf-muted' },
-      'Select counties or other areas to outline them on the map, see what’s inside them, filter buildings to them (Filters → Numbers & flags) and measure coverage inside them.'));
-
-    // US counties
     const us = h('div', { class: 'mcmf-card' }, h('b', null, 'US counties'));
     if (!atlas) {
       const msg = h('div', { class: 'mcmf-muted' }, 'Loading county boundaries…');
@@ -1508,7 +1648,78 @@
         a.state ? chipGroup(counties.map((c) => ({ key: c.id, label: c.name })), a.selected, { tri: false, onChange: refresh }) : null,
       );
     }
-    if (IS_US || atlas) bodyEl.append(us);
+    return us;
+  }
+
+  function ukCountiesCard() {
+    const a = cfg.areas;
+    const items = ukList(a.ukRegion);
+    const loaded = items.filter((c) => areaGeo.has(c.id)).length;
+    const missing = items.length - loaded;
+    const selectAndLoad = (ids) => {
+      for (const id of ids) a.selected[id] = 1;
+      areasChanged();
+      loadUkItems(items.filter((c) => ids.includes(c.id)));
+      renderBody();
+    };
+    return h('div', { class: 'mcmf-card' },
+      h('b', null, 'UK counties'),
+      select(a, 'ukRegion', Object.entries(UK_REGIONS).map(([k, r]) => [k, r.title]), () => {
+        drawAreas();
+        saveCfg();
+        renderBody();
+      }),
+      h('label', { class: 'mcmf-row' },
+        h('input', {
+          type: 'checkbox', checked: a.pick,
+          onchange: (e) => {
+            a.pick = e.target.checked;
+            drawAreas();
+            saveCfg();
+            renderBody();
+          },
+        }),
+        'Click counties on the map to select them'),
+      a.pick && missing ? h('div', { class: 'mcmf-muted' },
+        `${missing} of ${items.length} boundaries aren’t downloaded yet, so they can’t be clicked. `,
+        ukLoad.running ? null : h('a', { href: '#', onclick: (e) => { e.preventDefault(); loadUkItems(items); } },
+          `Download them (about ${Math.ceil(missing * 1.2)} s, once)`)) : null,
+      ukLoad.running ? h('div', { id: 'mcmf-ukload', class: 'mcmf-muted' }, `Loading boundaries… ${ukLoad.done} / ${ukLoad.total}`) : null,
+      ukLoad.failed.length ? h('div', { class: 'mcmf-muted mcmf-err' },
+        `Couldn’t find a boundary for ${ukLoad.failed.join(', ')}. Try the search box below.`) : null,
+      h('div', { class: 'mcmf-row' },
+        h('span', { class: 'mcmf-muted', style: 'flex:1' }, `${items.length} areas · ${items.filter((c) => a.selected[c.id]).length} selected`),
+        h('button', { class: 'mcmf-btn', onclick: () => selectAndLoad(items.map((c) => c.id)) }, 'All'),
+        h('button', {
+          class: 'mcmf-btn',
+          onclick: () => {
+            for (const c of items) delete a.selected[c.id];
+            areasChanged();
+            renderBody();
+          },
+        }, 'None')),
+      chipGroup(items.map((c) => ({ key: c.id, label: c.label })), a.selected, {
+        tri: false,
+        onChange: () => {
+          const toLoad = items.filter((c) => a.selected[c.id] && !areaGeo.has(c.id));
+          areasChanged();
+          if (toLoad.length) loadUkItems(toLoad);
+          renderBody();
+        },
+      }),
+      h('div', { class: 'mcmf-muted' }, 'Boundaries come from OpenStreetMap and are saved in your browser after the first download.'));
+  }
+
+  function renderAreas() {
+    const a = cfg.areas;
+    const [unitLabel, unitMul] = areaUnit();
+    const fmt = (n) => Math.round(n).toLocaleString();
+
+    bodyEl.append(h('div', { class: 'mcmf-muted' },
+      'Select counties or other areas to outline them on the map, see what’s inside them, filter buildings to them (Filters → Numbers & flags) and measure coverage inside them.'));
+
+    if (IS_US) bodyEl.append(usCountiesCard());
+    if (IS_UK) bodyEl.append(ukCountiesCard());
 
     // Any area via OpenStreetMap
     const q = { v: '' };
@@ -1542,11 +1753,11 @@
     };
     showResults();
     bodyEl.append(h('div', { class: 'mcmf-card' },
-      h('b', null, IS_US ? 'Any other area' : 'Find an area'),
+      h('b', null, IS_US || IS_UK ? 'Any other area' : 'Find an area'),
       h('div', { class: 'mcmf-muted' }, 'Cities, townships, counties, districts… anywhere, from OpenStreetMap.'),
       h('div', { class: 'mcmf-row' },
         h('input', {
-          type: 'search', class: 'mcmf-input', style: 'flex:1;width:auto', placeholder: IS_US ? 'e.g. Pittsburgh, PA' : 'e.g. Kent, England',
+          type: 'search', class: 'mcmf-input', style: 'flex:1;width:auto', placeholder: IS_US ? 'e.g. Pittsburgh, PA' : IS_UK ? 'e.g. Canterbury, Kent' : 'e.g. Kent, England',
           oninput: (e) => { q.v = e.target.value.trim(); },
           onkeydown: (e) => { if (e.key === 'Enter') doSearch(); },
         }),
@@ -1780,6 +1991,17 @@
     layers.areas = L.layerGroup().addTo(map);
     for (const [id, a] of Object.entries(store.get('areaGeo', {}))) areaGeo.set(id, CORE.makeArea(id, a.name, a.polys));
     drawAreas();
+    if (IS_UK) {
+      areaDb.all().then((rows) => {
+        for (const row of rows) if (!areaGeo.has(row.id)) areaGeo.set(row.id, CORE.makeArea(row.id, row.name, row.polys));
+        drawAreas();
+        apply();
+        if (cfg.ui.tab === 'areas') renderBody();
+        // Re-fetch any selected county whose cached boundary was cleared by the browser.
+        const all = Object.keys(UK_REGIONS).flatMap(ukList);
+        loadUkItems(all.filter((c) => cfg.areas.selected[c.id] && !areaGeo.has(c.id)));
+      });
+    }
     if (Object.keys(cfg.areas.selected).some((id) => id.startsWith('us:'))) {
       loadAtlas().then(() => {
         drawAreas();
