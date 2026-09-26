@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Readiness Report
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.1.0
+// @version      0.2.0
 // @description  Compares your buildings, extensions, staff training and vehicles with the missions the game can give you, and shows where you're short. Open it from the Tampermonkey menu.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -133,23 +133,29 @@
      *   missions: normalized missions,
      *   buildingCounts: {typeId: n}, vehicleCounts: {typeId: n}, trainingCounts: {name: n} | null,
      *   hospitalExtensions: [caption], maps: {prereq: {key: [typeId]}, req: {key: [typeId]}, edu: {key: [name]}}
+     *   skip: {buildingTypes: [typeId], specs: bool}  (optional: leave these out, e.g. hospitals)
      * }
      */
     function analyze(input) {
       const { missions, buildingCounts, vehicleCounts, trainingCounts, hospitalExtensions, maps } = input;
+      const skipTypes = new Set(((input.skip && input.skip.buildingTypes) || []).map(String));
+      const skipSpecs = !!(input.skip && input.skip.specs);
       const unknown = { prereq: new Set(), req: new Set(), edu: new Set() };
       const rows = missions.map((m) => {
         const missing = [];
         for (const [k, need] of Object.entries(m.prereq)) {
-          const ids = maps.prereq[k];
-          if (!ids || !ids.length) {
+          const mapped = maps.prereq[k];
+          if (!mapped || !mapped.length) {
             unknown.prereq.add(k);
             continue;
           }
+          const ids = mapped.filter((id) => !skipTypes.has(String(id)));
+          if (!ids.length) continue; // only left-out building types satisfy this: ignore it
           const have = sumOf(ids, buildingCounts);
           if (have < need) missing.push({ key: k, need, have });
         }
-        if (m.mainBuilding !== null && m.mainBuilding !== undefined && !(buildingCounts[String(m.mainBuilding)] > 0)) {
+        if (m.mainBuilding !== null && m.mainBuilding !== undefined && !skipTypes.has(String(m.mainBuilding))
+          && !(buildingCounts[String(m.mainBuilding)] > 0)) {
           missing.push({ key: `main_building:${m.mainBuilding}`, need: 1, have: 0 });
         }
         const short = [];
@@ -171,7 +177,7 @@
           const have = sumOf(names, trainingCounts);
           if (have < need) short.push({ kind: 'training', key: k, need, have });
         }
-        for (const sp of m.specs) {
+        for (const sp of skipSpecs ? [] : m.specs) {
           if (!specCovered(sp, hospitalExtensions)) short.push({ kind: 'specialization', key: sp, need: 1, have: 0 });
         }
         return { m, missing, unlocked: !missing.length, short };
@@ -326,7 +332,7 @@
 
   const state = {
     loading: false, error: '', buildings: [], vehicles: [], missions: [], meta: { b: {}, v: {} },
-    staff: lsGet(`${MCMF}staff`, {}), report: null, radiusKm: lsGet(`${MCR}radius`, 20),
+    staff: lsGet(`${MCMF}staff`, {}), report: null, radiusKm: lsGet(`${MCR}radius`, 20), noHospitals: lsGet(`${MCR}noHospitals`, false),
     overrides: lsGet(`${MCR}maps`, { prereq: {}, req: {}, edu: {} }),
     scan: { running: false, abort: false, done: 0, total: 0 },
   };
@@ -394,6 +400,7 @@
   }
 
   const typeName = (id) => state.meta.b[String(id)] || `Building type ${id}`;
+  const isHospitalType = (id) => /hospital|krankenhaus/i.test(typeName(id));
   const vehName = (id) => state.meta.v[String(id)] || `Vehicle type ${id}`;
 
   function candidates() {
@@ -456,7 +463,12 @@
       for (const e of b.extensions || []) if (e.available && e.enabled !== false) hospitalExtensions.push(String(e.caption));
     }
     const maps = mappings();
-    const res = CORE.analyze({ missions: state.missions, buildingCounts, vehicleCounts, trainingCounts, hospitalExtensions, maps });
+    const hospitalTypes = state.noHospitals ? maps.cands.bld.map((c) => c.id).filter(isHospitalType) : [];
+    const res = CORE.analyze({
+      missions: state.missions, buildingCounts, vehicleCounts, trainingCounts, hospitalExtensions, maps,
+      skip: { buildingTypes: hospitalTypes, specs: state.noHospitals },
+    });
+    const listed = state.noHospitals ? state.buildings.filter((b) => !isHospitalType(b.building_type)) : state.buildings;
 
     // Where on the map each vehicle gap bites.
     const vehByBuilding = new Map();
@@ -480,9 +492,9 @@
       .sort((a, b) => b.share - a.share);
 
     const out6 = state.vehicles.filter((v) => Number(v.fms_real) === 6);
-    const understaffed = state.buildings.filter((b) => Number(b.personal_count_goal) > Number(b.personal_count));
+    const understaffed = listed.filter((b) => Number(b.personal_count_goal) > Number(b.personal_count));
     const typesWithVehicles = new Set(state.buildings.filter((b) => vehByBuilding.has(b.id)).map((b) => b.building_type));
-    const empty = state.buildings.filter((b) => typesWithVehicles.has(b.building_type) && !vehByBuilding.has(b.id));
+    const empty = listed.filter((b) => typesWithVehicles.has(b.building_type) && !vehByBuilding.has(b.id));
 
     state.report = {
       ...res, maps, local, stationsCount: stations.length, out6, understaffed, empty,
@@ -631,6 +643,17 @@
     }
 
     const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+    body.append(h('label', { class: 'row', style: 'margin-top:12px' },
+      h('input', {
+        type: 'checkbox', checked: state.noHospitals,
+        onchange: (e) => {
+          state.noHospitals = e.target.checked;
+          lsSet(`${MCR}noHospitals`, state.noHospitals);
+          buildReport();
+          render();
+        },
+      }),
+      'Leave out hospitals (their building requirements, specialties and housekeeping)'));
     body.append(h('div', { class: 'tiles' },
       h('div', { class: 'tile' }, h('b', null, `${r.unlocked} / ${r.total}`), 'mission types unlocked'),
       h('div', { class: 'tile' }, h('b', null, `${pct(r.covered, r.unlocked)}%`), `of unlocked missions your own fleet can fully handle (${r.covered})`),

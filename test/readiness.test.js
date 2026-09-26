@@ -99,3 +99,24 @@ test('localShortfall counts vehicles at nearby stations', () => {
   assert.deepEqual(weak.map((s) => [s.name, s.have]), [['C', 0]]);
   assert.deepEqual(R.localShortfall(st, ['3'], 2, 10).map((s) => s.name), ['C', 'A', 'B']);
 });
+
+test('analyze: leaving out hospitals ignores their requirements and specialties', () => {
+  const missions = R.normalizeMissions([
+    { id: 1, name: 'Needs hospital', prerequisites: { hospitals: 1, fire_stations: 1 }, requirements: {}, additional: { patient_specializations: 'Trauma' } },
+    { id: 2, name: 'Hospital main building', prerequisites: { main_building: 4 }, requirements: {}, additional: {} },
+    { id: 3, name: 'Fire or hospital', prerequisites: { big_buildings: 2 }, requirements: {}, additional: {} },
+  ]);
+  const base = {
+    missions, buildingCounts: { 0: 1, 4: 5 }, vehicleCounts: {}, trainingCounts: null, hospitalExtensions: [],
+    maps: { prereq: { hospitals: ['4'], fire_stations: ['0'], big_buildings: ['0', '4'] }, req: {}, edu: {} },
+  };
+  const all = R.analyze(base);
+  assert.equal(all.gaps.length, 1); // Trauma specialty missing
+  assert.equal(all.unlocked, 3);
+  const noHosp = R.analyze({ ...base, buildingCounts: { 0: 1 }, skip: { buildingTypes: [4], specs: true } });
+  assert.equal(noHosp.gaps.length, 0);
+  assert.equal(noHosp.rows[0].unlocked, true); // hospital requirement ignored
+  assert.equal(noHosp.rows[1].unlocked, true); // hospital main building ignored
+  assert.deepEqual(noHosp.rows[2].missing, [{ key: 'big_buildings', need: 2, have: 1 }]); // only fire stations count now
+  assert.deepEqual(noHosp.unlocks.map((u) => u.key), ['big_buildings']);
+});
