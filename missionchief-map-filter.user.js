@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Map Filter & Coverage
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.5.0
+// @version      0.6.0
 // @description  Filter your buildings on the map by type, extensions, specializations, vehicles, vehicle status, staff training and more; draw station coverage with gap analysis, and select counties or other areas to plan coverage.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -411,13 +411,6 @@
       return joinAddress([t['addr:housename'], street, place, t['addr:postcode']]);
     }
 
-    /** Address from a Nominatim reverse-geocoding "address" object. */
-    function formatReverse(a) {
-      if (!a) return '';
-      const street = joinAddress([a.house_number, a.road]).replace(', ', ' ');
-      return joinAddress([street, a.suburb || a.village || a.hamlet, a.town || a.city || a.village, a.postcode]);
-    }
-
     /** Overpass elements → sites [{id, cat, name, lat, lng, address, aande}], one per element, first matching category. */
     function parseSites(elements, keys) {
       const cats = SITE_CATS.filter((c) => keys.includes(c.key));
@@ -617,7 +610,7 @@
       FMS_LABELS, buildIndex, matchChips, matches, filtersActive, defaultFilters, countActive,
       tally, distKm, isCovered, centersNear, gridCoverage, toCsv, mergeDeep, collectSpecs,
       topoFeatures, geojsonToPolys, makeArea, inArea, areaKm2, areaCoverage,
-      SITE_CATS, overpassQuery, formatAddress, formatReverse, parseSites, dedupeSites, markBuilt,
+      SITE_CATS, overpassQuery, formatAddress, parseSites, dedupeSites, markBuilt,
       catFromTypeName, catFromName, nameTokens, namesSimilar, clusterBuildings,
     };
   })();
@@ -686,7 +679,7 @@
     sites: {
       cats: { fire: 1, ambulance: 1, police: 1, hospital: 1, coastguard: 1, lifeboat: 1, air: 1, rescue: 1 },
       hideBuilt: true, radius: 500, showOnMap: true,
-      source: 'alliance', groupRadius: 250, minCount: 2, similarNames: true,
+      source: 'alliance', groupRadius: 250, minCount: 2, similarNames: true, scanZoom: 13,
     },
     staffScan: { delay: 350, onlyMatched: false, maxAgeHours: 24 },
     presets: {},
@@ -1324,6 +1317,7 @@
     };
     return {
       all: () => run('readonly', (st) => st.getAll()).catch(() => []),
+      get: (id) => run('readonly', (st) => st.get(id)).catch(() => null),
       put: (v) => run('readwrite', (st) => st.put(v)).catch((e) => console.warn('[MCMF] could not cache boundary', e)),
       clear: () => run('readwrite', (st) => st.clear()).catch(() => {}),
     };
@@ -1422,7 +1416,6 @@
 
   const OVERPASS_URLS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
   const sites = { list: [], loading: false, error: '', fetchedAt: null, diag: '', source: '' };
-  const addrJob = { running: false, abort: false, done: 0, total: 0 };
   let sitePin = null;
   const siteCat = (k) => CORE.SITE_CATS.find((c) => c.key === k);
   const siteKeys = () => Object.keys(cfg.sites.cats).filter((k) => cfg.sites.cats[k] === 1);
@@ -1486,16 +1479,66 @@
 
   const stripHtml = (t) => String(t || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-  /** Buildings on the map that aren't yours: /api/alliance_buildings plus any building markers not in your list. */
+  /* Other players' buildings. The game only loads them near where you're looking (more as you zoom in), so
+   * every one that appears is remembered here, and "Scan my areas" pans the map over your areas to load them all. */
+  const others = new Map(); // id -> {id, name, lat, lng, type, owner, seen}
+  const OTHERS_KEY = 'cache:others';
+  const saveOthers = debounce(() => areaDb.put({ id: OTHERS_KEY, items: [...others.values()] }), 3000);
+
+  const iconUrl = (l) => l.options && l.options.icon && l.options.icon.options && l.options.icon.options.iconUrl;
+  const markerBuildingId = (l) => Number(l.building_id ?? (l.options && l.options.building_id));
+
+  /** Visit every building marker on the map, including ones held inside groups or clusters. */
+  function eachBuildingMarker(fn) {
+    const seen = new Set();
+    const visit = (l) => {
+      if (!l || seen.has(l)) return;
+      seen.add(l);
+      const id = markerBuildingId(l);
+      if (Number.isFinite(id) && l.getLatLng) fn(id, l);
+      else if (typeof l.getLayers === 'function') l.getLayers().forEach(visit);
+    };
+    map.eachLayer(visit);
+  }
+
+  /** Remember other players' buildings that are loaded right now. Returns how many were new. */
+  function collectLoaded() {
+    if (!map || !index.length) return 0;
+    const markers = [];
+    eachBuildingMarker((id, l) => markers.push([id, l]));
+    // Other players' markers carry no type, but a type's icon is the same for everyone: learn it from yours.
+    const iconType = new Map();
+    for (const [id, l] of markers) if (byId.has(id) && iconUrl(l)) iconType.set(iconUrl(l), byId.get(id).type);
+    let added = 0;
+    for (const [id, l] of markers) {
+      if (byId.has(id)) continue;
+      const ll = l.getLatLng();
+      const tip = l.getTooltip && l.getTooltip();
+      const prev = others.get(id);
+      if (!prev) added++;
+      others.set(id, {
+        id,
+        name: stripHtml((l.options && l.options.title) || (tip && tip.getContent && tip.getContent()) || (prev && prev.name) || ''),
+        lat: ll.lat,
+        lng: ll.lng,
+        type: l.building_type ?? (iconType.has(iconUrl(l)) ? iconType.get(iconUrl(l)) : prev ? prev.type : null),
+        owner: l.user_id ?? (prev ? prev.owner : null),
+        seen: Date.now(),
+      });
+    }
+    if (added) saveOthers();
+    return added;
+  }
+
+  /** Everything known about other players' buildings: the alliance list plus everything collected from the map. */
   async function collectOtherBuildings() {
-    const mine = new Set(index.map((r) => r.id));
+    const diag = { api: 0, map: 0, apiError: '' };
     const out = new Map();
-    const diag = { api: 0, markers: 0, apiError: '' };
     try {
       const j = await getJSON('/api/alliance_buildings');
       for (const b of Array.isArray(j) ? j : (j && j.result) || []) {
         const id = Number(b.id);
-        if (mine.has(id) || !Number.isFinite(Number(b.latitude))) continue;
+        if (byId.has(id) || !Number.isFinite(Number(b.latitude))) continue;
         diag.api++;
         out.set(id, {
           id, name: String(b.caption || ''), lat: Number(b.latitude), lng: Number(b.longitude),
@@ -1505,30 +1548,92 @@
     } catch (e) {
       diag.apiError = e.message;
     }
-    const markers = [];
-    map.eachLayer((l) => {
-      const id = Number(l.building_id ?? (l.options && l.options.building_id));
-      if (Number.isFinite(id) && l.getLatLng) markers.push([id, l]);
-    });
-    // Other players' markers carry no type, but the icon for a type is the same for everyone: learn it from yours.
-    const iconUrl = (l) => l.options && l.options.icon && l.options.icon.options && l.options.icon.options.iconUrl;
-    const iconType = new Map();
-    for (const [id, l] of markers) if (byId.has(id) && iconUrl(l)) iconType.set(iconUrl(l), byId.get(id).type);
-    for (const [id, l] of markers) {
-      if (mine.has(id) || out.has(id)) continue;
-      diag.markers++;
-      const ll = l.getLatLng();
-      const tip = l.getTooltip && l.getTooltip();
-      out.set(id, {
-        id,
-        name: stripHtml((l.options && l.options.title) || (tip && tip.getContent && tip.getContent()) || ''),
-        lat: ll.lat,
-        lng: ll.lng,
-        type: l.building_type ?? (iconType.has(iconUrl(l)) ? iconType.get(iconUrl(l)) : null),
-        owner: l.user_id ?? null,
-      });
+    collectLoaded();
+    for (const [id, b] of others) {
+      if (byId.has(id)) continue; // it's become yours since
+      const known = out.get(id);
+      if (known) {
+        if (!known.name) known.name = b.name;
+        continue;
+      }
+      diag.map++;
+      out.set(id, b);
     }
     return { list: [...out.values()], diag };
+  }
+
+  const mapScan = { running: false, abort: false, done: 0, total: 0, found: 0 };
+
+  /** Map centres at zoom z that together cover the selected areas (views that miss every area are skipped). */
+  function scanViews(z) {
+    const sel = selectedAreas();
+    if (!sel.length) return [];
+    const bb = sel.reduce((b, a) => ({
+      south: Math.min(b.south, a.bbox.south), west: Math.min(b.west, a.bbox.west),
+      north: Math.max(b.north, a.bbox.north), east: Math.max(b.east, a.bbox.east),
+    }), { south: Infinity, west: Infinity, north: -Infinity, east: -Infinity });
+    const size = map.getSize();
+    const stepX = size.x * 0.9;
+    const stepY = size.y * 0.9;
+    const nw = map.project([bb.north, bb.west], z);
+    const se = map.project([bb.south, bb.east], z);
+    const views = [];
+    for (let y = nw.y + stepY / 2; y < se.y + stepY / 2; y += stepY) {
+      for (let x = nw.x + stepX / 2; x < se.x + stepX / 2; x += stepX) {
+        const pts = [];
+        for (const fy of [-0.5, 0, 0.5]) for (const fx of [-0.5, 0, 0.5]) pts.push(map.unproject([x + fx * stepX, y + fy * stepY], z));
+        const tl = pts[0];
+        const br = pts[8];
+        const hit = sel.some((a) => pts.some((p) => CORE.inArea(p.lat, p.lng, a))
+          || ((a.bbox.north + a.bbox.south) / 2 <= tl.lat && (a.bbox.north + a.bbox.south) / 2 >= br.lat
+            && (a.bbox.west + a.bbox.east) / 2 >= tl.lng && (a.bbox.west + a.bbox.east) / 2 <= br.lng));
+        if (hit) views.push(map.unproject([x, y], z));
+      }
+    }
+    return views;
+  }
+
+  /** Resolve once the game seems to have finished adding building markers after a move. */
+  function markersSettled() {
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      let last = t0;
+      const onAdd = (e) => {
+        if (e.layer && (Number.isFinite(markerBuildingId(e.layer)) || typeof e.layer.getLayers === 'function')) last = Date.now();
+      };
+      map.on('layeradd', onAdd);
+      const tick = () => {
+        const now = Date.now();
+        if ((now - t0 >= 1200 && now - last >= 700) || now - t0 >= 6000 || mapScan.abort) {
+          map.off('layeradd', onAdd);
+          resolve();
+        } else setTimeout(tick, 150);
+      };
+      tick();
+    });
+  }
+
+  async function scanAreas() {
+    if (mapScan.running) return;
+    const z = Math.min(18, Math.max(8, Number(cfg.sites.scanZoom) || 13));
+    const views = scanViews(z);
+    if (!views.length) return;
+    const start = { center: map.getCenter(), zoom: map.getZoom() };
+    Object.assign(mapScan, { running: true, abort: false, done: 0, total: views.length, found: 0 });
+    renderBody();
+    for (const c of views) {
+      if (mapScan.abort) break;
+      map.setView(c, z, { animate: false });
+      await markersSettled();
+      mapScan.found += collectLoaded();
+      mapScan.done++;
+      const el = document.getElementById('mcmf-mapscan');
+      if (el) el.textContent = `Scanning… view ${mapScan.done} of ${mapScan.total} · ${mapScan.found} new buildings`;
+    }
+    mapScan.running = false;
+    map.setView(start.center, start.zoom, { animate: false });
+    await areaDb.put({ id: OTHERS_KEY, items: [...others.values()] });
+    await findAllianceSites();
   }
 
   async function findAllianceSites() {
@@ -1556,7 +1661,7 @@
         .filter((x) => x.area)
         .sort((a, b) => b.count - a.count || a.area.localeCompare(b.area) || a.name.localeCompare(b.name));
       sites.diag = `Found ${list.length} buildings by other players (${diag.api} from the alliance list`
-        + `${diag.apiError ? `, which failed: ${diag.apiError}` : ''}, ${diag.markers} more from the map)`
+        + `${diag.apiError ? `, which failed: ${diag.apiError}` : ''}, ${diag.map} more collected from the map)`
         + ` → ${typed.filter((b) => b.cat).length} recognised as an emergency service type → ${inAreas.length} inside your areas`
         + ` → ${sites.list.length} locations where at least ${Math.max(1, Number(cfg.sites.minCount) || 2)} were built.`;
       sites.source = 'alliance';
@@ -1570,57 +1675,16 @@
     if (cfg.ui.tab === 'sites') renderBody();
   }
 
-  async function lookupAddress(x) {
-    const url = 'https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=en'
-      + `&lat=${x.lat}&lon=${x.lng}`;
-    const j = await nominatim(url);
-    x.address = CORE.formatReverse(j && j.address) || (j && j.display_name) || '';
-    x.nearest = true; // nearest known address to the pin, not one tagged on the station itself
-  }
-
-  async function lookupMissing() {
-    const todo = visibleSites().filter((x) => !x.address && !x.lookupFailed);
-    if (!todo.length || addrJob.running) return;
-    Object.assign(addrJob, { running: true, abort: false, done: 0, total: todo.length });
-    renderBody();
-    for (const x of todo) {
-      if (addrJob.abort) break;
-      try {
-        await lookupAddress(x);
-      } catch (e) {
-        x.lookupFailed = true;
-      }
-      addrJob.done++;
-      const el = document.getElementById('mcmf-addrjob');
-      if (el) el.textContent = `Looking up addresses… ${addrJob.done} / ${addrJob.total}`;
-    }
-    addrJob.running = false;
-    if (cfg.ui.tab === 'sites') renderBody();
-  }
-
-  function copyText(text, btn) {
-    const done = () => {
-      const old = btn.textContent;
-      btn.textContent = 'Copied';
-      setTimeout(() => { btn.textContent = old; }, 1200);
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, () => prompt('Copy this:', text));
-    else prompt('Copy this:', text);
-  }
-
   const coords = (x) => `${x.lat.toFixed(6)}, ${x.lng.toFixed(6)}`;
 
   function sitePopup(x) {
     const cat = siteCat(x.cat);
-    const copyBtn = h('button', { class: 'mcmf-btn', onclick: () => copyText(x.address || coords(x), copyBtn) }, 'Copy address');
     return h('div', { class: 'mcmf-pop' },
       h('b', null, x.name),
       h('div', { class: 'mcmf-muted' }, cat.label.replace(/s$/, ''), x.aande ? ' · A&E' : '', ` · ${x.area}`),
-      h('div', { class: 'mcmf-pop-row' }, x.address || (x.members ? 'No address looked up yet' : 'No address in OpenStreetMap'), x.nearest ? ' (nearest address)' : ''),
       x.members ? h('div', { class: 'mcmf-pop-row' }, `Built by ${x.count} alliance members: ${x.members.join(', ')}`) : null,
       h('div', { class: 'mcmf-pop-row mcmf-muted' }, coords(x)),
-      x.built ? h('div', { class: 'mcmf-pop-row' }, `You have “${x.built}” nearby`) : null,
-      h('div', { class: 'mcmf-pop-row' }, copyBtn));
+      x.built ? h('div', { class: 'mcmf-pop-row' }, `You have “${x.built}” nearby`) : null);
   }
 
   function drawSites() {
@@ -1646,11 +1710,10 @@
   }
 
   function exportSites() {
-    const rows = [['category', 'name', 'address', 'address_source', 'latitude', 'longitude', 'area', 'a_and_e', 'already_built_nearby',
+    const rows = [['category', 'name', 'latitude', 'longitude', 'area', 'a_and_e', 'already_built_nearby',
       'alliance_buildings', 'alliance_names', 'osm']];
     for (const x of visibleSites()) {
-      rows.push([siteCat(x.cat).label, x.name, x.address, x.address ? (x.nearest ? 'nearest address' : 'OpenStreetMap') : '',
-        x.lat.toFixed(6), x.lng.toFixed(6), x.area, x.aande ? 'yes' : '', x.built || '',
+      rows.push([siteCat(x.cat).label, x.name, x.lat.toFixed(6), x.lng.toFixed(6), x.area, x.aande ? 'yes' : '', x.built || '',
         x.count || '', x.members ? x.members.join('; ') : '', x.members ? '' : `https://www.openstreetmap.org/${x.id}`]);
     }
     download(`sites-${HOST}-${new Date().toISOString().slice(0, 10)}.csv`, CORE.toCsv(rows), 'text/csv');
@@ -2338,6 +2401,54 @@
     if (el) el.textContent = lastStats || 'Enable an option above to see stats for the current view.';
   }
 
+  function allianceScanBox() {
+    const cs = cfg.sites;
+    collectLoaded();
+    const sel = selectedAreas();
+    const inAreas = [...others.values()].filter((b) => sel.some((a) => CORE.inArea(b.lat, b.lng, a))).length;
+    const z = Math.min(18, Math.max(8, Number(cs.scanZoom) || 13));
+    const views = mapScan.running ? [] : scanViews(z);
+    const mins = Math.ceil((views.length * 1.6) / 60);
+    return h('div', { class: 'mcmf-card' },
+      h('div', null, h('b', null, 'Other players’ buildings collected: '), `${others.size}`,
+        h('span', { class: 'mcmf-muted' }, ` (${inAreas} in your areas)`)),
+      h('div', { class: 'mcmf-muted' },
+        'The game only loads other players’ buildings near where you’re looking, and more as you zoom in. '
+        + 'Every one that appears is remembered. Scan moves the map across your areas to load them all: '
+        + 'zoom in until all the buildings show, press “Use current”, then Scan.'),
+      h('div', { class: 'mcmf-row' },
+        h('span', null, 'Scan zoom'),
+        numInput(cs, 'scanZoom', { min: 8, onChange: debounce(() => { saveCfg(); renderBody(); }, 600) }),
+        h('button', {
+          class: 'mcmf-btn',
+          id: 'mcmf-usezoom',
+          onclick: () => {
+            cs.scanZoom = map.getZoom();
+            saveCfg();
+            renderBody();
+          },
+        }, `Use current (${map.getZoom()})`)),
+      mapScan.running
+        ? h('div', { class: 'mcmf-row' },
+          h('span', { id: 'mcmf-mapscan', class: 'mcmf-muted', style: 'flex:1' },
+            `Scanning… view ${mapScan.done} of ${mapScan.total} · ${mapScan.found} new buildings`),
+          h('button', { class: 'mcmf-btn', onclick: () => { mapScan.abort = true; } }, 'Stop'))
+        : h('div', { class: 'mcmf-row' },
+          h('button', { class: 'mcmf-btn', disabled: !views.length, onclick: scanAreas },
+            `Scan my areas (${views.length} views, ~${mins} min)`),
+          h('button', {
+            class: 'mcmf-btn',
+            title: 'Forget all collected buildings, e.g. after members moved or demolished stations',
+            onclick: () => {
+              if (!confirm('Forget all collected buildings of other players?')) return;
+              others.clear();
+              areaDb.put({ id: OTHERS_KEY, items: [] });
+              renderBody();
+            },
+          }, 'Forget')),
+      z < 12 && views.length ? h('div', { class: 'mcmf-muted' }, 'At low zooms the game may not show every building, so the scan could miss some.') : null);
+  }
+
   function renderSites() {
     const cs = cfg.sites;
     const sel = selectedAreas();
@@ -2375,6 +2486,7 @@
       alliance ? h('label', { class: 'mcmf-row' },
         h('input', { type: 'checkbox', checked: cs.similarNames, onchange: (e) => { cs.similarNames = e.target.checked; saveCfg(); } }),
         'Only group buildings with similar names') : null,
+      alliance ? allianceScanBox() : null,
       chipGroup(CORE.SITE_CATS.map((c) => ({ key: c.key, label: c.label, count: sites.list.length ? counts[c.key] || 0 : undefined })), cs.cats, {
         tri: false,
         onChange: () => {
@@ -2410,19 +2522,12 @@
 
     const vis = visibleSites();
     const builtCount = sites.list.filter((x) => siteKeys().includes(x.cat) && x.built).length;
-    const noAddr = vis.filter((x) => !x.address && !x.lookupFailed).length;
     bodyEl.append(h('div', { class: 'mcmf-card' },
       h('div', null, h('b', null, vis.filter((x) => !x.built).length), ' sites to build',
         builtCount ? h('span', { class: 'mcmf-muted' }, ` · ${builtCount} already built${cs.hideBuilt ? ' (hidden)' : ''}`) : null),
       h('div', { class: 'mcmf-row' },
-        addrJob.running
-          ? [h('span', { id: 'mcmf-addrjob', class: 'mcmf-muted' }, `Looking up addresses… ${addrJob.done} / ${addrJob.total}`),
-            h('button', { class: 'mcmf-btn', onclick: () => { addrJob.abort = true; } }, 'Stop')]
-          : noAddr ? h('button', {
-            class: 'mcmf-btn', title: 'OpenStreetMap allows one lookup per second', onclick: lookupMissing,
-          }, `Look up ${noAddr} missing addresses (~${Math.ceil(noAddr * 1.1)} s)`) : null,
         h('button', { class: 'mcmf-btn', disabled: !vis.length, onclick: exportSites }, 'Export sites CSV')),
-      h('div', { class: 'mcmf-muted' }, 'Show centres the map on the exact spot and rings it. Addresses marked “nearest” are the closest address to the site, so check the pin.')));
+      h('div', { class: 'mcmf-muted' }, 'Show zooms the map onto the site and rings it, so you can place your building on the ring.')));
 
     for (const c of CORE.SITE_CATS) {
       const items = vis.filter((x) => x.cat === c.key);
@@ -2430,31 +2535,12 @@
       if (cfg.ui.sections[`site-${c.key}`] === undefined) cfg.ui.sections[`site-${c.key}`] = true;
       bodyEl.append(section(`site-${c.key}`, h('span', { style: `color:${c.color}` }, `${c.label} (${items.length})`), null,
         items.map((x) => {
-          const copyBtn = h('button', { class: 'mcmf-btn', title: 'Copy the address (or coordinates if there is none)', onclick: () => copyText(x.address || coords(x), copyBtn) }, 'Copy');
-          const lookBtn = !x.address && !x.lookupFailed ? h('button', {
-            class: 'mcmf-btn',
-            onclick: async () => {
-              lookBtn.disabled = true;
-              lookBtn.textContent = '…';
-              try {
-                await lookupAddress(x);
-              } catch (e) {
-                x.lookupFailed = true;
-              }
-              renderBody();
-            },
-          }, 'Find address') : null;
           return h('div', { class: 'mcmf-site' },
             h('div', { class: 'mcmf-row' },
               h('b', { style: 'flex:1' }, x.name,
                 x.aande ? h('span', { class: 'mcmf-badge', style: 'margin-left:6px' }, 'A&E') : null,
                 x.count ? h('span', { class: 'mcmf-badge', style: 'margin-left:6px', title: 'Alliance members who built here' }, `${x.count}×`) : null),
-              h('button', { class: 'mcmf-btn', onclick: () => showSite(x) }, 'Show'),
-              copyBtn),
-            h('div', { class: 'mcmf-stat' },
-              x.address ? [x.address, x.nearest ? h('i', null, ' (nearest)') : null]
-                : x.lookupFailed ? 'No address found' : x.members ? 'No address yet' : 'No address in OpenStreetMap',
-              lookBtn ? [' ', lookBtn] : null),
+              h('button', { class: 'mcmf-btn', onclick: () => showSite(x) }, 'Show')),
             x.members ? h('div', { class: 'mcmf-stat', title: x.members.join('\n') },
               `Built by ${x.count} members as: ${[...new Set(x.members)].slice(0, 4).join(' · ')}${new Set(x.members).size > 4 ? ' …' : ''}`) : null,
             h('div', { class: 'mcmf-stat' }, `${x.area} · ${coords(x)}`,
@@ -2622,11 +2708,22 @@
     areaRenderer = L.svg({ pane: 'mcmfAreas', padding: 0.5 });
     layers.areas = L.layerGroup().addTo(map);
     layers.sites = L.layerGroup().addTo(map);
+    areaDb.get(OTHERS_KEY).then((rec) => {
+      for (const b of (rec && rec.items) || []) if (!others.has(b.id)) others.set(b.id, b);
+    });
+    const collectSoon = debounce(() => { if (!mapScan.running) collectLoaded(); }, 1500);
+    map.on('layeradd moveend', collectSoon);
+    map.on('zoomend', () => {
+      const b = document.getElementById('mcmf-usezoom');
+      if (b) b.textContent = `Use current (${map.getZoom()})`;
+    });
     for (const [id, a] of Object.entries(store.get('areaGeo', {}))) areaGeo.set(id, CORE.makeArea(id, a.name, a.polys));
     drawAreas();
     if (IS_UK) {
       areaDb.all().then((rows) => {
-        for (const row of rows) if (!areaGeo.has(row.id)) areaGeo.set(row.id, CORE.makeArea(row.id, row.name, row.polys));
+        for (const row of rows) {
+          if (row.polys && !areaGeo.has(row.id)) areaGeo.set(row.id, CORE.makeArea(row.id, row.name, row.polys));
+        }
         drawAreas();
         apply();
         if (cfg.ui.tab === 'areas') renderBody();

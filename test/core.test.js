@@ -188,8 +188,6 @@ test('sites: address formatting', () => {
   assert.equal(CORE.formatAddress({ 'addr:street': 'High Street' }), 'High Street');
   assert.equal(CORE.formatAddress({ 'addr:city': 'Truro' }), ''); // a town alone isn't a usable address
   assert.equal(CORE.formatAddress({ 'addr:postcode': 'TR1 1AA' }), 'TR1 1AA');
-  assert.equal(CORE.formatReverse({ house_number: '5', road: 'Station Rd', village: 'Bude', postcode: 'EX23 8AA' }), '5 Station Rd, Bude, EX23 8AA');
-  assert.equal(CORE.formatReverse({ road: 'A30', town: 'Bodmin', postcode: 'PL31' }), 'A30, Bodmin, PL31');
 });
 
 test('sites: duplicates of one station collapse to the better entry', () => {
