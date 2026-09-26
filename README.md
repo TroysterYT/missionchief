@@ -94,13 +94,28 @@ It runs alongside LSS-Manager. Type names come from the public LSS-Manager API, 
 
 Staff training needs a staff scan. The report shares the scan results with the map filter script, so stations scanned there count here too.
 
-The mission list names requirements with internal codes (for example `firetrucks`), which the report matches to your game's names automatically. Some vehicles count as more than one type: a UK CARP counts as a pump and an aerial appliance, a US Quint as an engine and a platform truck, and a US Rescue Engine as an engine and a heavy rescue. These are built in, and matching also uses any custom type names you've given your vehicles. Every shortfall row shows which vehicle types it counted and has a **Fix** button that lists your own vehicle types first, with how many you have. **How requirements were matched** shows every match. Click names on or off to fix one, and your changes are saved. **Export** saves the whole report as JSON.
+The mission list names requirements with internal codes (for example `firetrucks`), which the report matches to your game's names automatically. On MissionChief UK, which vehicles count for each requirement comes from LSS-Manager's data, the same list LSS-Manager uses for missing vehicles. So dual-role vehicles are counted correctly, for example a CARP as both a pump and an aerial appliance, and an ARV as a police car. Where one vehicle counts for several requirements, the report also checks that each vehicle fills only one slot per mission. On other servers the report guesses from vehicle names, with the Quint, Rescue Engine and CARP built in. Every shortfall row shows which vehicle types it counted and has a **Fix** button that lists your own vehicle types first, with how many you have. **How requirements were matched** shows every match. Click names on or off to fix one, and your changes are saved. **Export** saves the whole report as JSON.
 
 ### Install
 
 With Tampermonkey enabled, open the [raw readiness script](https://raw.githubusercontent.com/TroysterYT/missionchief/main/missionchief-readiness.user.js) and click **Install**, then reload the game.
 
 Each script has its own link. Tampermonkey shows **Update** when a newer version is available, and **Reinstall** when you already have the latest one.
+
+### Updating the vehicle substitution list
+
+The UK table in `missionchief-readiness.user.js` is generated from an LSS-Manager checkout:
+
+```sh
+git clone --depth 1 https://github.com/LSS-Manager/lssm-v.4 ../lssm-v.4
+node scripts/build-substitutions.js ../lssm-v.4 --write
+```
+
+The generator fails loudly if a requirement it expects has been renamed, so a game update can't silently break the table.
+
+## Credits
+
+The vehicle substitution data is derived from [LSS-Manager](https://github.com/LSS-Manager/lssm-v.4), licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). That data, the generated block in `missionchief-readiness.user.js`, is shared under the same licence and must not be used commercially.
 
 ### Development
 
