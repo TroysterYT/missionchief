@@ -90,6 +90,8 @@ It runs alongside LSS-Manager. Type names come from the public LSS-Manager API, 
 - **Weak areas**: for each vehicle requirement, which of your stations don't have enough of it within a distance you set (20 km by default), with a button to show each one on the map.
 - **Housekeeping**: buildings below their personnel goal, vehicles out of service, and stations with no vehicles.
 
+**Leave out hospitals** drops hospital building requirements, hospital specialty shortfalls and hospitals in housekeeping from the report. The setting is remembered.
+
 Staff training needs a staff scan. The report shares the scan results with the map filter script, so stations scanned there count here too.
 
 The mission list names requirements with internal codes (for example `firetrucks`), which the report matches to your game's names automatically. **How requirements were matched** shows every match. Click names on or off to fix one, and your changes are saved. **Export** saves the whole report as JSON.
