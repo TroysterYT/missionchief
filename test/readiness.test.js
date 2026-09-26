@@ -132,3 +132,48 @@ test('autoMap: dual-role vehicles count for each role they cover', () => {
   for (const id of [0, 20, 21, 30, 31, 40]) assert.ok(R.autoMap('firetrucks', veh).includes(id), `firetrucks should include ${id}`);
   assert.deepEqual(R.autoMap('heavy_rescue_vehicles', veh), [31, 32]);
 });
+
+test('UK substitution table from LSS-Manager covers dual-role vehicles', () => {
+  const uk = R.SUBSTITUTIONS.en_GB.req;
+  assert.deepEqual(uk.platform_trucks, [2, 17]); // Aerial Appliance, CARP
+  assert.ok(uk.firetrucks.includes(17) && uk.firetrucks.includes(0)); // CARP and Water Ladder are pumps
+  assert.ok(uk.heavy_rescue_vehicles.includes(16)); // Rescue Pump
+  assert.ok(uk.police_cars.includes(13)); // ARV counts as a police car
+  assert.ok(Object.keys(uk).length > 60);
+});
+
+test('analyze: per-mission alternatives widen what counts', () => {
+  const missions = R.normalizeMissions([
+    { id: 1, name: 'Plain', prerequisites: {}, requirements: { firetrucks: 2 }, additional: {} },
+    { id: 2, name: 'Rescue ok', prerequisites: {}, requirements: { firetrucks: 2 }, additional: { allow_rw_instead_of_lf: true } },
+  ]);
+  assert.deepEqual(missions[1].allow, ['allow_rw_instead_of_lf']);
+  const res = R.analyze({
+    missions, buildingCounts: {}, vehicleCounts: { 0: 1, 4: 1 }, trainingCounts: null, hospitalExtensions: [],
+    maps: { prereq: {}, req: { firetrucks: ['0'] }, edu: {}, alt: { allow_rw_instead_of_lf: { firetrucks: [4] } } },
+  });
+  assert.equal(res.rows[0].short.length, 1); // 1 pump, needs 2
+  assert.equal(res.rows[1].short.length, 0); // pump + RSU is allowed here
+});
+
+test('maxAssign: a dual-role vehicle fills only one slot', () => {
+  // 11 CARPs (17) count as pump or aerial; 5 Water Ladders (0) are pumps only.
+  const reqs = [{ need: 12, ids: ['0', '17'] }, { need: 6, ids: ['17'] }];
+  assert.equal(R.maxAssign(reqs, { 0: 5, 17: 11 }), 16); // 18 slots, 16 vehicles
+  assert.equal(R.maxAssign(reqs, { 0: 7, 17: 11 }), 18);
+  assert.equal(R.maxAssign([{ need: 3, ids: ['1'] }], { 1: 2 }), 2);
+});
+
+test('analyze: flags missions where shared vehicles cannot cover every requirement at once', () => {
+  const missions = R.normalizeMissions([
+    { id: 1, name: 'Tower', prerequisites: {}, requirements: { firetrucks: 12, platform_trucks: 6 }, additional: {} },
+    { id: 2, name: 'Small', prerequisites: {}, requirements: { firetrucks: 4, platform_trucks: 2 }, additional: {} },
+  ]);
+  const res = R.analyze({
+    missions, buildingCounts: {}, vehicleCounts: { 0: 5, 17: 11 }, trainingCounts: null, hospitalExtensions: [],
+    maps: { prereq: {}, req: { firetrucks: ['0', '17'], platform_trucks: ['17'] }, edu: {} },
+  });
+  assert.deepEqual(res.rows[0].short, [{ kind: 'vehicle', key: 'firetrucks+platform_trucks', need: 18, have: 16, combined: true }]);
+  assert.deepEqual(res.rows[1].short, []);
+  assert.equal(res.gaps[0].key, 'firetrucks+platform_trucks');
+});

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Readiness Report
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.3.0
+// @version      0.4.0
 // @description  Compares your buildings, extensions, staff training and vehicles with the missions the game can give you, and shows where you're short. Open it from the Tampermonkey menu.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -22,6 +22,11 @@
 
 (function () {
   'use strict';
+
+  // BEGIN GENERATED SUBSTITUTIONS: node scripts/build-substitutions.js <lssm-v.4 checkout> --write
+  // Derived from LSS-Manager 4.7.12+20260923.1524 (https://github.com/LSS-Manager/lssm-v.4), CC BY-NC-SA 4.0.
+  const SUBSTITUTIONS = {"en_GB":{"req":{"firetrucks":[0,1,16,17,26,37,38,47],"platform_trucks":[2,17],"battalion_chief_vehicles":[3,15,44,77],"heavy_rescue_vehicles":[4,16,38,43],"mobile_air_vehicles":[14,39,46,49],"water_tankers":[6,26,36,41,50],"mobile_command_vehicles":[15,31,44,77],"hazmat_vehicles":[7,32,39,48,49],"ambulances":[5],"police_cars":[8,12,13,19,24,25,51,52,56,82,116],"helicopter":[9],"rth":[9],"police_helicopters":[11],"swat_suv":[13,25,52,56,82],"k9":[12,53],"kdow_orgl":[20,31,34],"traffic_car":[24,25],"atv_carrier":[30],"hazard_response_primary":[27],"hazard_response_secondary":[28],"emergency_welfare":[29,39,45,49,115],"ems_mobile_command":[34],"foam":[35,36,37,38,42,75],"mass_casualty_equipment":[33],"police_horse":[55],"water_rescue":[66,73,93],"height_rescue_units":[59],"flood_equipment":[61],"coastal_rescue":[57,58,59],"coastal_command":[60],"coastal_boat":[67,74],"large_coastal_boat":[68,69],"coastal_guard_boat":[69],"coastal_helicopter":[64,65],"mud_rescue":[62],"coastal_support":[63],"coastal_jetski":[70],"coastal_mud_rescue":[58],"coastal_boat_hover":[71],"arff":[75],"riv":[76],"rettungstreppe":[2,17,78],"elw_airport":[77],"airport_equipment":[79,80],"airport_command":[80],"search_and_rescue":[86,87,92],"search_and_rescue_command":[85],"midwife":[95],"rescue_dogs":[101,102],"two_way":[107],"railway_police":[108],"bomb_disposal_command":[109],"bomb_disposal_crew":[110],"bomb_disposal_equipment":[111],"bomb_disposal_heavy_equipment":[112],"bomb_disposal_diver_crew":[113],"bomb_disposal_diver_equipment":[114],"oneof_fire_engine_or_airport_fire_engine":[0,1,16,17,26,37,38,47,76],"oneof_fire_engine_or_airport_fire_engine_large":[0,1,16,17,26,37,38,47,75],"oneof_fire_engine_or_airport_fire_engine_or_engine_large":[0,1,16,17,26,37,38,47,75,76],"oneof_airport_fire_engine_or_engine_large":[75,76],"oneof_fire_engine_or_rescue":[0,1,4,16,17,26,37,38,43,47],"oneof_fire_engine_or_rescue_or_ladder":[0,1,2,4,16,17,26,37,38,43,47],"oneof_fire_ladder_or_rescue_stairs":[2,17,78],"oneof_fire_command_or_airport_fire_command":[3,15,44,77],"oneof_fire_command_advanced_or_airport_fire_command":[15,31,44,77],"oneof_coastal_guard_boat_or_boat_large":[68,69],"oneof_police_patrol_or_swat":[8,12,13,19,24,25,51,52,56,82,116],"oneof_police_drone_or_helicopter":[11,89,90,91],"oneof_mountain_atv_or_search_and_rescue_atv":[66,73,93,99],"oneof_paramedic_or_paramedic_advanced":[94,96]},"alt":{"allow_rw_instead_of_lf":{"firetrucks":[0,1,4,16,17,26,37,38,43,47]},"allow_arff_instead_of_lf":{"firetrucks":[75,76]}}}};
+  // END GENERATED SUBSTITUTIONS
 
   /* ------------------------------------------------------------------ *
    * Core: pure analysis (no DOM). Unit tested.                          *
@@ -63,6 +68,7 @@
           specs: (Array.isArray(specs) ? specs : []).map((s) => String(s).trim()).filter(Boolean),
           credits: toNum(m.average_credits) || 0,
           overlay: id.includes('/'),
+          allow: Object.keys(add).filter((k) => k.startsWith('allow_') && add[k]),
         });
       }
       return out;
@@ -131,10 +137,48 @@
     const sumOf = (ids, counts) => ids.reduce((s, id) => s + (counts[String(id)] || 0), 0);
 
     /**
+     * How many requirement slots can be filled when each vehicle fills at most one slot (a vehicle that counts for
+     * several requirements, like a CARP, still only goes once). reqs: [{need, ids}], counts: {typeId: n}.
+     * Max-flow over source → vehicle type → requirement → sink.
+     */
+    function maxAssign(reqs, counts) {
+      const types = [...new Set(reqs.flatMap((r) => r.ids.map(String)))].filter((id) => counts[id] > 0);
+      const n = types.length + reqs.length + 2;
+      const src = 0;
+      const sink = n - 1;
+      const cap = Array.from({ length: n }, () => new Array(n).fill(0));
+      types.forEach((id, i) => { cap[src][1 + i] = counts[id]; });
+      reqs.forEach((r, j) => {
+        const rj = 1 + types.length + j;
+        cap[rj][sink] = r.need;
+        for (const id of r.ids.map(String)) {
+          const i = types.indexOf(id);
+          if (i >= 0) cap[1 + i][rj] = Infinity;
+        }
+      });
+      let total = 0;
+      for (;;) {
+        const prev = new Array(n).fill(-1);
+        prev[src] = src;
+        const queue = [src];
+        while (queue.length && prev[sink] < 0) {
+          const u = queue.shift();
+          for (let v = 0; v < n; v++) if (prev[v] < 0 && cap[u][v] > 0) { prev[v] = u; queue.push(v); }
+        }
+        if (prev[sink] < 0) return total;
+        let f = Infinity;
+        for (let v = sink; v !== src; v = prev[v]) f = Math.min(f, cap[prev[v]][v]);
+        for (let v = sink; v !== src; v = prev[v]) { cap[prev[v]][v] -= f; cap[v][prev[v]] += f; }
+        total += f;
+      }
+    }
+
+    /**
      * input: {
      *   missions: normalized missions,
      *   buildingCounts: {typeId: n}, vehicleCounts: {typeId: n}, trainingCounts: {name: n} | null,
-     *   hospitalExtensions: [caption], maps: {prereq: {key: [typeId]}, req: {key: [typeId]}, edu: {key: [name]}}
+     *   hospitalExtensions: [caption],
+     *   maps: {prereq: {key: [typeId]}, req: {key: [typeId]}, edu: {key: [name]}, alt?: {allowFlag: {key: [typeId]}}}
      *   skip: {buildingTypes: [typeId], specs: bool}  (optional: leave these out, e.g. hospitals)
      * }
      */
@@ -161,14 +205,28 @@
           missing.push({ key: `main_building:${m.mainBuilding}`, need: 1, have: 0 });
         }
         const short = [];
+        const vehReqs = [];
         for (const [k, need] of Object.entries(m.req)) {
-          const ids = maps.req[k];
+          let ids = maps.req[k];
+          // Some missions also accept other vehicles for a requirement (e.g. rescue vehicles instead of pumps).
+          const extra = (m.allow || []).flatMap((f) => (maps.alt && maps.alt[f] && maps.alt[f][k]) || []);
+          if (ids && ids.length && extra.length) ids = [...new Set([...ids.map(String), ...extra.map(String)])];
           if (!ids || !ids.length) {
             unknown.req.add(k);
             continue;
           }
           const have = sumOf(ids, vehicleCounts);
           if (have < need) short.push({ kind: 'vehicle', key: k, need, have });
+          vehReqs.push({ key: k, need, ids });
+        }
+        // Each requirement may be fine alone while shared vehicles can't cover them all at once.
+        if (!short.length && vehReqs.length > 1) {
+          const overlapping = vehReqs.filter((a) => vehReqs.some((b) => b !== a && a.ids.some((id) => b.ids.map(String).includes(String(id)))));
+          if (overlapping.length > 1) {
+            const need = overlapping.reduce((t, r) => t + r.need, 0);
+            const have = maxAssign(overlapping, vehicleCounts);
+            if (have < need) short.push({ kind: 'vehicle', key: overlapping.map((r) => r.key).sort().join('+'), need, have, combined: true });
+          }
         }
         for (const [k, need] of Object.entries(m.edu)) {
           const names = maps.edu[k];
@@ -258,7 +316,7 @@
       return out.sort((a, b) => a.have - b.have);
     }
 
-    return { normalizeMissions, tokens, autoMap, specCovered, analyze, localShortfall, distKm };
+    return { normalizeMissions, tokens, autoMap, specCovered, analyze, localShortfall, distKm, maxAssign, SUBSTITUTIONS };
   })();
 
   if (typeof module === 'object' && module.exports) {
@@ -438,25 +496,31 @@
       Object.keys(m.req).forEach((k) => keys.req.add(k));
       Object.keys(m.edu).forEach((k) => keys.edu.add(k));
     }
+    const known = (SUBSTITUTIONS[LOCALES[HOST]] || {});
     const pick = (kind, key, cands) => {
       const o = state.overrides[kind] && state.overrides[kind][key];
-      return { ids: o || CORE.autoMap(key, cands), auto: !o };
+      if (o) return { ids: o, auto: false, source: 'yours' };
+      if (kind === 'req' && known.req && known.req[key]) return { ids: known.req[key].map(String), auto: true, source: 'lssm' };
+      return { ids: CORE.autoMap(key, cands), auto: true, source: 'guess' };
     };
-    const out = { prereq: {}, req: {}, edu: {}, auto: { prereq: {}, req: {}, edu: {} }, cands: c };
+    const out = { prereq: {}, req: {}, edu: {}, auto: { prereq: {}, req: {}, edu: {} }, source: { prereq: {}, req: {}, edu: {} }, alt: known.alt || {}, cands: c };
     for (const k of keys.prereq) {
       const p = pick('prereq', k, c.bld);
       out.prereq[k] = p.ids;
       out.auto.prereq[k] = p.auto;
+      out.source.prereq[k] = p.source;
     }
     for (const k of keys.req) {
       const p = pick('req', k, c.veh);
       out.req[k] = p.ids;
       out.auto.req[k] = p.auto;
+      out.source.req[k] = p.source;
     }
     for (const k of keys.edu) {
       const p = pick('edu', k, c.edu);
       out.edu[k] = p.ids;
       out.auto.edu[k] = p.auto;
+      out.source.edu[k] = p.source;
     }
     return out;
   }
@@ -480,7 +544,7 @@
     const maps = mappings();
     const hospitalTypes = state.noHospitals ? maps.cands.bld.map((c) => c.id).filter(isHospitalType) : [];
     const res = CORE.analyze({
-      missions: state.missions, buildingCounts, vehicleCounts, trainingCounts, hospitalExtensions, maps,
+      missions: state.missions, buildingCounts, vehicleCounts, trainingCounts, hospitalExtensions, maps: { ...maps, alt: maps.alt },
       skip: { buildingTypes: hospitalTypes, specs: state.noHospitals },
     });
     const listed = state.noHospitals ? state.buildings.filter((b) => !isHospitalType(b.building_type)) : state.buildings;
@@ -691,13 +755,15 @@
     if (!r.gaps.length) body.append(h('p', { class: 'ok' }, 'No shortfalls found for unlocked missions.'));
     else {
       body.append(h('p', { class: 'muted' },
-        'Some vehicles count as more than one type (for example a CARP is both a pump and an aerial appliance). '
-        + 'If a row counts too few, press Fix and click the vehicle types that should count.'));
+        'Vehicles that count as more than one type (for example a CARP is both a pump and an aerial appliance) are included'
+        + (SUBSTITUTIONS[LOCALES[HOST]] ? ' using LSS-Manager’s list for your game.' : ' where known.')
+        + ' If a row still counts too few, press Fix and click the vehicle types that should count.'));
       body.append(h('table', null,
         h('tr', null, h('th', null, 'Need'), h('th', null, 'Kind'), h('th', { class: 'n' }, 'You have'), h('th', { class: 'n' }, 'Up to'),
           h('th', { class: 'n' }, 'Missions'), h('th', null, 'For example'), h('th', null, '')),
         r.gaps.slice(0, 40).flatMap((g) => {
-          const table = { vehicle: 'req', training: 'edu' }[g.kind];
+          const combined = g.key.includes('+');
+          const table = combined ? null : { vehicle: 'req', training: 'edu' }[g.kind];
           const counted = table ? (r.maps[table][g.key] || []).map((id) => (table === 'req' ? vehName(id) : id)) : [];
           const editRow = h('tr', { hidden: true }, h('td', { colspan: 7 }));
           const fix = table ? h('button', {
@@ -708,7 +774,9 @@
             },
           }, 'Fix') : null;
           return [h('tr', null,
-            h('td', null, g.kind === 'specialization' ? labelFor(g.kind, g.key) : g.key.replace(/_/g, ' '),
+            h('td', null, g.kind === 'specialization' ? labelFor(g.kind, g.key)
+              : combined ? `${g.key.split('+').map((k) => k.replace(/_/g, ' ')).join(' + ')} together` : g.key.replace(/_/g, ' '),
+              combined ? h('div', { class: 'muted' }, 'Enough of each on its own, but some vehicles count for more than one of these and can only fill one slot per mission.') : null,
               counted.length ? h('div', { class: 'muted' }, `Counting: ${counted.join(', ')}`) : null),
             h('td', { class: 'muted' }, g.kind),
             h('td', { class: `n ${g.have ? 'warn' : 'bad'}` }, g.have),
@@ -766,6 +834,12 @@
     }
 
     body.append(renderMappings(r));
+    if (SUBSTITUTIONS[LOCALES[HOST]]) {
+      body.append(h('p', { class: 'muted', style: 'margin-top:18px' },
+        'Which vehicles count for each requirement comes from ',
+        h('a', { href: 'https://github.com/LSS-Manager/lssm-v.4', target: '_blank', rel: 'noopener' }, 'LSS-Manager'),
+        ' (CC BY-NC-SA 4.0).'));
+    }
     root.replaceChildren(box);
   }
 
@@ -797,7 +871,7 @@
     }
     return h('div', { style: 'margin:6px 0' },
       h('div', { class: 'row' }, h('b', null, key),
-        r.maps.auto[kind][key] ? h('span', { class: 'muted' }, '(automatic)') : h('span', { class: 'muted' }, '(your choice)'),
+        h('span', { class: 'muted' }, { yours: '(your choice)', lssm: '(from LSS-Manager’s data)', guess: '(guessed from names)' }[r.maps.source[kind][key]] || ''),
         r.maps.auto[kind][key] ? null : h('button', {
           class: 'btn',
           onclick: () => {
