@@ -120,3 +120,15 @@ test('analyze: leaving out hospitals ignores their requirements and specialties'
   assert.deepEqual(noHosp.rows[2].missing, [{ key: 'big_buildings', need: 2, have: 1 }]); // only fire stations count now
   assert.deepEqual(noHosp.unlocks.map((u) => u.key), ['big_buildings']);
 });
+
+test('autoMap: dual-role vehicles count for each role they cover', () => {
+  const veh = [
+    { id: 0, caption: 'Water Ladder' }, { id: 2, caption: 'Aerial Appliance' },
+    { id: 20, caption: 'CARP' }, { id: 21, caption: 'Combined Aerial Rescue Pump' },
+    { id: 30, caption: 'Quint' }, { id: 31, caption: 'Rescue Engine' }, { id: 32, caption: 'Heavy Rescue Vehicle' },
+    { id: 40, caption: 'Vehicle type 99 / CARP' }, // game name unknown, but you called it CARP
+  ];
+  assert.deepEqual(R.autoMap('platform_trucks', veh), [2, 20, 21, 30, 40]);
+  for (const id of [0, 20, 21, 30, 31, 40]) assert.ok(R.autoMap('firetrucks', veh).includes(id), `firetrucks should include ${id}`);
+  assert.deepEqual(R.autoMap('heavy_rescue_vehicles', veh), [31, 32]);
+});

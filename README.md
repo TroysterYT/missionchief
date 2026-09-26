@@ -94,7 +94,7 @@ It runs alongside LSS-Manager. Type names come from the public LSS-Manager API, 
 
 Staff training needs a staff scan. The report shares the scan results with the map filter script, so stations scanned there count here too.
 
-The mission list names requirements with internal codes (for example `firetrucks`), which the report matches to your game's names automatically. **How requirements were matched** shows every match. Click names on or off to fix one, and your changes are saved. **Export** saves the whole report as JSON.
+The mission list names requirements with internal codes (for example `firetrucks`), which the report matches to your game's names automatically. Some vehicles count as more than one type: a UK CARP counts as a pump and an aerial appliance, a US Quint as an engine and a platform truck, and a US Rescue Engine as an engine and a heavy rescue. These are built in, and matching also uses any custom type names you've given your vehicles. Every shortfall row shows which vehicle types it counted and has a **Fix** button that lists your own vehicle types first, with how many you have. **How requirements were matched** shows every match. Click names on or off to fix one, and your changes are saved. **Export** saves the whole report as JSON.
 
 ### Install
 

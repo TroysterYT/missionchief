@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Readiness Report
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.2.0
+// @version      0.3.0
 // @description  Compares your buildings, extensions, staff training and vehicles with the missions the game can give you, and shows where you're short. Open it from the Tampermonkey menu.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -77,10 +77,12 @@
 
     // Phrases that identify what a requirement key means, for US and UK wording. Excludes stop false matches.
     const SYN = {
-      firetrucks: { any: ['fire engine', 'engine', 'water ladder', 'pump', 'water tender', 'type 1', 'type 2'], not: /air|arff|airport|boat|officer|chief|foam|tanker|carrier/ },
-      platform_trucks: { any: ['aerial', 'ladder', 'platform', 'turntable', 'tower'], not: /water ladder/ },
+      // Dual-role vehicles count for several requirements: UK CARP (Combined Aerial Rescue Pump) is a pump and an
+      // aerial; US Quint is an engine and a platform truck; US Rescue Engine is an engine and a heavy rescue.
+      firetrucks: { any: ['fire engine', 'engine', 'water ladder', 'pump', 'water tender', 'type 1', 'type 2', 'carp', 'quint'], not: /air|arff|airport|boat|officer|chief|foam|tanker|carrier/ },
+      platform_trucks: { any: ['aerial', 'ladder', 'platform', 'turntable', 'tower', 'carp', 'quint'], not: /water ladder/ },
       battalion_chief_vehicles: { any: ['battalion chief', 'fire officer', 'officer', 'chief'], not: /ems|police/ },
-      heavy_rescue_vehicles: { any: ['heavy rescue', 'rescue support', 'rescue tender', 'rescue unit'] },
+      heavy_rescue_vehicles: { any: ['heavy rescue', 'rescue support', 'rescue tender', 'rescue unit', 'rescue engine'] },
       hazmat_vehicles: { any: ['hazmat', 'hazardous', 'haz mat', 'detection', 'dim'] },
       mobile_command_vehicles: { any: ['mobile command', 'command support', 'incident command', 'command unit', 'control unit'] },
       water_tankers: { any: ['tanker', 'water carrier', 'bulk water'] },
@@ -403,15 +405,28 @@
   const isHospitalType = (id) => /hospital|krankenhaus/i.test(typeName(id));
   const vehName = (id) => state.meta.v[String(id)] || `Vehicle type ${id}`;
 
+  /**
+   * Everything a requirement can be matched to: {id, caption, owned}. Vehicle captions also include any custom type
+   * names you gave your vehicles (e.g. "CARP"), so the automatic matching can use them.
+   */
   function candidates() {
-    const veh = new Map(Object.entries(state.meta.v).map(([id, c]) => [id, c]));
-    for (const v of state.vehicles) if (!veh.has(String(v.vehicle_type))) veh.set(String(v.vehicle_type), vehName(v.vehicle_type));
-    const bld = new Map(Object.entries(state.meta.b).map(([id, c]) => [id, c]));
-    for (const b of state.buildings) if (!bld.has(String(b.building_type))) bld.set(String(b.building_type), typeName(b.building_type));
-    const trainings = new Set();
-    for (const s of Object.values(state.staff)) for (const t of Object.keys(s.trainings || {})) trainings.add(t);
-    const list = (m) => [...m.entries()].map(([id, caption]) => ({ id, caption }));
-    return { veh: list(veh), bld: list(bld), edu: [...trainings].map((t) => ({ id: t, caption: t })) };
+    const veh = new Map(Object.keys(state.meta.v).map((id) => [id, { owned: 0, names: new Set() }]));
+    for (const v of state.vehicles) {
+      const id = String(v.vehicle_type);
+      if (!veh.has(id)) veh.set(id, { owned: 0, names: new Set() });
+      const e = veh.get(id);
+      e.owned++;
+      if (v.vehicle_type_caption && v.vehicle_type_caption !== vehName(id)) e.names.add(String(v.vehicle_type_caption));
+    }
+    const bld = new Map(Object.keys(state.meta.b).map((id) => [id, 0]));
+    for (const b of state.buildings) bld.set(String(b.building_type), (bld.get(String(b.building_type)) || 0) + 1);
+    const trainings = new Map();
+    for (const s of Object.values(state.staff)) for (const [t, n] of Object.entries(s.trainings || {})) trainings.set(t, (trainings.get(t) || 0) + n);
+    return {
+      veh: [...veh.entries()].map(([id, e]) => ({ id, caption: [vehName(id), ...e.names].join(' / '), owned: e.owned })),
+      bld: [...bld.entries()].map(([id, n]) => ({ id, caption: typeName(id), owned: n })),
+      edu: [...trainings.entries()].map(([t, n]) => ({ id: t, caption: t, owned: n })),
+    };
   }
 
   /** Mapping per key: your saved choice, else the automatic guess. */
@@ -675,15 +690,33 @@
       h('p', { class: 'muted' }, 'Things missions you can already get need, but you don’t have enough of anywhere. Sorted by how many mission types are affected.'));
     if (!r.gaps.length) body.append(h('p', { class: 'ok' }, 'No shortfalls found for unlocked missions.'));
     else {
+      body.append(h('p', { class: 'muted' },
+        'Some vehicles count as more than one type (for example a CARP is both a pump and an aerial appliance). '
+        + 'If a row counts too few, press Fix and click the vehicle types that should count.'));
       body.append(h('table', null,
-        h('tr', null, h('th', null, 'Need'), h('th', null, 'Kind'), h('th', { class: 'n' }, 'You have'), h('th', { class: 'n' }, 'Up to'), h('th', { class: 'n' }, 'Missions'), h('th', null, 'For example')),
-        r.gaps.slice(0, 40).map((g) => h('tr', null,
-          h('td', null, labelFor(g.kind, g.key)),
-          h('td', { class: 'muted' }, g.kind),
-          h('td', { class: `n ${g.have ? 'warn' : 'bad'}` }, g.have),
-          h('td', { class: 'n' }, g.maxNeed),
-          h('td', { class: 'n' }, g.missions.length),
-          h('td', { class: 'muted' }, [...new Set(g.missions)].slice(0, 3).join(', '))))));
+        h('tr', null, h('th', null, 'Need'), h('th', null, 'Kind'), h('th', { class: 'n' }, 'You have'), h('th', { class: 'n' }, 'Up to'),
+          h('th', { class: 'n' }, 'Missions'), h('th', null, 'For example'), h('th', null, '')),
+        r.gaps.slice(0, 40).flatMap((g) => {
+          const table = { vehicle: 'req', training: 'edu' }[g.kind];
+          const counted = table ? (r.maps[table][g.key] || []).map((id) => (table === 'req' ? vehName(id) : id)) : [];
+          const editRow = h('tr', { hidden: true }, h('td', { colspan: 7 }));
+          const fix = table ? h('button', {
+            class: 'btn',
+            onclick: () => {
+              if (!editRow.firstChild.firstChild) editRow.firstChild.append(chipEditor(table, g.key, () => { buildReport(); render(); }));
+              editRow.hidden = !editRow.hidden;
+            },
+          }, 'Fix') : null;
+          return [h('tr', null,
+            h('td', null, g.kind === 'specialization' ? labelFor(g.kind, g.key) : g.key.replace(/_/g, ' '),
+              counted.length ? h('div', { class: 'muted' }, `Counting: ${counted.join(', ')}`) : null),
+            h('td', { class: 'muted' }, g.kind),
+            h('td', { class: `n ${g.have ? 'warn' : 'bad'}` }, g.have),
+            h('td', { class: 'n' }, g.maxNeed),
+            h('td', { class: 'n' }, g.missions.length),
+            h('td', { class: 'muted' }, [...new Set(g.missions)].slice(0, 3).join(', ')),
+            h('td', { class: 'n' }, fix)), editRow];
+        })));
     }
 
     // Unlocks
@@ -736,51 +769,63 @@
     root.replaceChildren(box);
   }
 
+  /**
+   * Chips to choose what satisfies one requirement code. Selected first, then what you own (most first), then the rest.
+   * Saves your choice immediately; onApply re-runs the report.
+   */
+  function chipEditor(kind, key, onApply) {
+    const r = state.report;
+    const cands = r.maps.cands[{ req: 'veh', prereq: 'bld', edu: 'edu' }[kind]];
+    const chosen = new Set((r.maps[kind][key] || []).map(String));
+    const chips = h('div', { class: 'chips' });
+    const sorted = cands.slice().sort((a, b) => Number(chosen.has(String(b.id))) - Number(chosen.has(String(a.id)))
+      || (b.owned || 0) - (a.owned || 0) || a.caption.localeCompare(b.caption));
+    for (const c of sorted) {
+      const chip = h('span', {
+        class: `chip${chosen.has(String(c.id)) ? ' on' : ''}`,
+        title: c.owned ? `You have ${c.owned}` : 'You have none',
+        onclick: () => {
+          if (chosen.has(String(c.id))) chosen.delete(String(c.id));
+          else chosen.add(String(c.id));
+          chip.classList.toggle('on');
+          state.overrides[kind] = state.overrides[kind] || {};
+          state.overrides[kind][key] = [...chosen];
+          lsSet(`${MCR}maps`, state.overrides);
+        },
+      }, c.caption, c.owned ? h('b', { style: 'margin-left:4px' }, `· ${c.owned}`) : null);
+      chips.append(chip);
+    }
+    return h('div', { style: 'margin:6px 0' },
+      h('div', { class: 'row' }, h('b', null, key),
+        r.maps.auto[kind][key] ? h('span', { class: 'muted' }, '(automatic)') : h('span', { class: 'muted' }, '(your choice)'),
+        r.maps.auto[kind][key] ? null : h('button', {
+          class: 'btn',
+          onclick: () => {
+            delete state.overrides[kind][key];
+            lsSet(`${MCR}maps`, state.overrides);
+            buildReport();
+            render();
+          },
+        }, 'Reset to automatic'),
+        onApply ? h('button', { class: 'btn primary', onclick: onApply }, 'Apply') : null),
+      chips);
+  }
+
   function renderMappings(r) {
     const wrap = h('div', null, h('h3', null, 'How requirements were matched'),
       h('p', { class: 'muted' }, 'The mission list names requirements with internal codes. Each code was matched to your game’s names automatically; '
         + 'fix any that look wrong by clicking names on or off. Your changes are saved. Codes with nothing matched are left out of the report.'));
     const unmatched = [...r.unknown.req.map((k) => `vehicle: ${k}`), ...r.unknown.prereq.map((k) => `building: ${k}`), ...r.unknown.edu.map((k) => `training: ${k}`)];
     if (unmatched.length) wrap.append(h('p', { class: 'warn' }, `Not matched yet (${unmatched.length}): ${unmatched.join(', ')}`));
-    const sections = [['req', 'Vehicle requirements', r.maps.cands.veh], ['prereq', 'Building requirements', r.maps.cands.bld], ['edu', 'Training requirements', r.maps.cands.edu]];
-    for (const [kind, title, cands] of sections) {
+    const sections = [['req', 'Vehicle requirements'], ['prereq', 'Building requirements'], ['edu', 'Training requirements']];
+    for (const [kind, title] of sections) {
       const keys = Object.keys(r.maps[kind]).sort();
       if (!keys.length) continue;
       const det = h('details', null, h('summary', null, `${title} (${keys.length})`));
       det.addEventListener('toggle', () => {
         if (!det.open || det.dataset.built) return;
         det.dataset.built = '1';
-        for (const k of keys) {
-          const chosen = new Set((r.maps[kind][k] || []).map(String));
-          const chips = h('div', { class: 'chips' });
-          const sorted = cands.slice().sort((a, b) => Number(chosen.has(String(b.id))) - Number(chosen.has(String(a.id))) || a.caption.localeCompare(b.caption));
-          for (const c of sorted) {
-            const chip = h('span', {
-              class: `chip${chosen.has(String(c.id)) ? ' on' : ''}`,
-              onclick: () => {
-                if (chosen.has(String(c.id))) chosen.delete(String(c.id));
-                else chosen.add(String(c.id));
-                chip.classList.toggle('on');
-                state.overrides[kind] = state.overrides[kind] || {};
-                state.overrides[kind][k] = [...chosen];
-                lsSet(`${MCR}maps`, state.overrides);
-              },
-            }, c.caption);
-            chips.append(chip);
-          }
-          det.append(h('div', { style: 'margin:8px 0' },
-            h('div', { class: 'row' }, h('b', null, k), r.maps.auto[kind][k] ? h('span', { class: 'muted' }, '(automatic)') : h('span', { class: 'muted' }, '(your choice)'),
-              r.maps.auto[kind][k] ? null : h('button', {
-                class: 'btn',
-                onclick: () => {
-                  delete state.overrides[kind][k];
-                  lsSet(`${MCR}maps`, state.overrides);
-                  buildReport();
-                  render();
-                },
-              }, 'Reset')),
-            chips));
-        }
+        for (const k of keys) det.append(chipEditor(kind, k));
         det.append(h('button', { class: 'btn primary', onclick: () => { buildReport(); render(); } }, 'Apply changes'));
       });
       wrap.append(det);
