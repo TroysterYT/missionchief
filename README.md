@@ -53,7 +53,12 @@ For each selected area you see its size, the buildings inside it by type, the mi
 
 ### Sites
 
-Finds real emergency service sites inside your selected areas using OpenStreetMap: fire, ambulance and police stations, hospitals (A&E marked), coastguard and lifeboat stations, air ambulance and police helicopter bases, and mountain and cave rescue. Sites where you already have a building of the matching type nearby (500 m by default) are hidden, so the list shows what's left to build.
+Finds emergency service sites to build inside your selected areas. There are two sources:
+
+- **Where alliance members have built** (default): looks at other players' buildings you can see (the alliance building list plus any other buildings on the map) and flags spots where several members built the same kind of building close together, optionally only when the names are similar. Those are very likely real stations. You can set the distance, how many members must have built there, and whether names must be similar.
+- **OpenStreetMap**: real sites from the map data. The tab shows how many results came back at each step, and a clear message when OpenStreetMap is too busy to answer.
+
+The OpenStreetMap source covers: fire, ambulance and police stations, hospitals (A&E marked), coastguard and lifeboat stations, air ambulance and police helicopter bases, and mountain and cave rescue. Sites where you already have a building of the matching type nearby (500 m by default) are hidden, so the list shows what's left to build.
 
 Each site shows its address and exact coordinates. **Show** centres the map on the spot and rings it, and **Copy** copies the address. When OpenStreetMap has no address for a site, **Find address** looks up the nearest one; check those against the pin. You can export the list to CSV.
 

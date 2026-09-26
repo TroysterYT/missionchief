@@ -229,3 +229,47 @@ test('sites: overpass query includes only requested categories', () => {
   assert.doesNotMatch(q, /hospital/);
   assert.match(q, /out center tags;$/);
 });
+
+test('alliance: categories from game type names and building names', () => {
+  assert.equal(CORE.catFromTypeName('Fire Station (Small)'), 'fire');
+  assert.equal(CORE.catFromTypeName('Fire Academy'), null);
+  assert.equal(CORE.catFromTypeName('Air Ambulance Station'), 'air');
+  assert.equal(CORE.catFromTypeName('Police Aviation'), 'air');
+  assert.equal(CORE.catFromTypeName('Coastal Rescue Station'), 'coastguard');
+  assert.equal(CORE.catFromName('Truro Fire Station'), 'fire');
+  assert.equal(CORE.catFromName('Cornwall Air Ambulance'), 'air');
+  assert.equal(CORE.catFromName('Falmouth RNLI'), 'lifeboat');
+  assert.equal(CORE.catFromName('Royal Cornwall Hospital'), 'hospital');
+  assert.equal(CORE.catFromName('Bob\'s base'), null);
+});
+
+test('alliance: name similarity ignores generic words', () => {
+  assert.deepEqual([...CORE.nameTokens('Exeter Middlemoor Fire Station 01')], ['exeter', 'middlemoor']);
+  assert.equal(CORE.namesSimilar('Exeter Fire Station', 'Exeter Middlemoor FS'), true);
+  assert.equal(CORE.namesSimilar('Exeter Fire Station', 'Plymouth Fire Station'), false);
+  assert.equal(CORE.namesSimilar('Fire Station', 'Plymouth Fire Station'), true); // generic name: location decides
+});
+
+test('alliance: clustering nearby buildings of one category with similar names', () => {
+  const b = (id, name, lat, lng, cat, owner) => ({ id, name, lat, lng, cat, owner });
+  const list = [
+    b(1, 'Truro Fire Station', 50.2600, -5.0500, 'fire', 10),
+    b(2, 'Truro FS', 50.2610, -5.0505, 'fire', 11), // ~115 m away
+    b(3, 'Truro Fire', 50.2605, -5.0510, 'fire', 12),
+    b(4, 'Truro Ambulance Station', 50.2601, -5.0501, 'ambulance', 13), // other category
+    b(5, 'Redruth Fire Station', 50.2602, -5.0502, 'fire', 14), // different name
+    b(6, 'Bodmin Fire Station', 50.4700, -4.7200, 'fire', 15), // alone
+    b(7, 'Bodmin Fire Station', 50.4701, -4.7201, 'fire', 15), // same owner twice counts once
+  ];
+  const groups = CORE.clusterBuildings(list, { radiusM: 250, minCount: 2 });
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].count, 3);
+  assert.equal(groups[0].name, 'Truro Fire Station'); // names tie on count, so the longest wins
+  assert.equal(groups[0].cat, 'fire');
+  assert.deepEqual(groups[0].members.map((m) => m.id).sort(), [1, 2, 3]);
+  assert.ok(Math.abs(groups[0].lat - 50.2605) < 0.001);
+  // Without the name check Redruth joins; min 1 keeps singles.
+  const loose = CORE.clusterBuildings(list, { radiusM: 250, minCount: 1, requireSimilarNames: false });
+  assert.equal(loose.find((g) => g.cat === 'fire' && g.count >= 3).count, 4);
+  assert.equal(loose.length, 3); // Truro fire group, ambulance, Bodmin
+});

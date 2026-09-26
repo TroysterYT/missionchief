@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Map Filter & Coverage
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.4.0
+// @version      0.5.0
 // @description  Filter your buildings on the map by type, extensions, specializations, vehicles, vehicle status, staff training and more; draw station coverage with gap analysis, and select counties or other areas to plan coverage.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -484,6 +484,115 @@
       return sites;
     }
 
+    /* ---- sites from alliance members' buildings ---- */
+
+    /** Site category from a game building type name, e.g. "Fire Station (Small)" → 'fire'. */
+    function catFromTypeName(n) {
+      if (!n) return null;
+      const c = SITE_CATS.find((x) => x.type.test(n) && !(x.notType && x.notType.test(n)));
+      return c ? c.key : null;
+    }
+
+    // Order matters: "Air Ambulance" is 'air', not 'ambulance'.
+    const NAME_CATS = [
+      ['air', /air ambulance|helicopter|\bheli|npas|police aviation/i],
+      ['lifeboat', /lifeboat|rnli/i],
+      ['coastguard', /coast ?guard/i],
+      ['rescue', /mountain rescue|cave rescue|search and rescue/i],
+      ['hospital', /hospital|infirmary|\bA ?& ?E\b/i],
+      ['ambulance', /ambulance/i],
+      ['police', /police|constabulary/i],
+      ['fire', /\bfire\b/i],
+    ];
+    function catFromName(name) {
+      const hit = NAME_CATS.find(([, re]) => re.test(name || ''));
+      return hit ? hit[0] : null;
+    }
+
+    const NAME_STOP = new Set(('fire station stations ambulance police hospital rescue service services community the and of '
+      + 'fs as ps ems hq small large big new old base centre center general county city district emergency air lifeboat rnli '
+      + 'coastguard coast guard mountain cave team unit standby post nhs trust fire-station').split(' '));
+
+    /** Distinctive words of a building name ("Exeter Middlemoor Fire Station" → exeter, middlemoor). */
+    function nameTokens(name) {
+      return new Set(String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').split(' ')
+        .filter((t) => t.length > 1 && !/^\d+$/.test(t) && !NAME_STOP.has(t)));
+    }
+
+    /** Similar when half of the shorter name's distinctive words appear in the other. Generic names match anything. */
+    function namesSimilar(a, b) {
+      const ta = nameTokens(a);
+      const tb = nameTokens(b);
+      if (!ta.size || !tb.size) return true;
+      let common = 0;
+      for (const t of ta) if (tb.has(t)) common++;
+      return common / Math.min(ta.size, tb.size) >= 0.5;
+    }
+
+    /**
+     * Group buildings [{id, name, lat, lng, cat, owner}] of the same category that are within radiusM of each other
+     * (and, with requireSimilarNames, have similar names). Returns groups of at least minCount buildings
+     * (distinct owners when known), largest first.
+     */
+    function clusterBuildings(list, { radiusM = 250, minCount = 2, requireSimilarNames = true } = {}) {
+      const parent = list.map((_, i) => i);
+      const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+      const cellLat = radiusM / 110574;
+      const grid = new Map();
+      const cellOf = (b) => {
+        const cellLng = radiusM / (111320 * Math.max(0.05, Math.cos((b.lat * Math.PI) / 180)));
+        return [Math.floor(b.lat / cellLat), Math.floor(b.lng / cellLng)];
+      };
+      list.forEach((b, i) => {
+        const [y, x] = cellOf(b);
+        const k = `${y}:${x}`;
+        if (!grid.has(k)) grid.set(k, []);
+        grid.get(k).push(i);
+      });
+      list.forEach((b, i) => {
+        const [y, x] = cellOf(b);
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            for (const j of grid.get(`${y + dy}:${x + dx}`) || []) {
+              if (j <= i) continue;
+              const o = list[j];
+              if (o.cat !== b.cat) continue;
+              if (distKm(b.lat, b.lng, o.lat, o.lng) * 1000 > radiusM) continue;
+              if (requireSimilarNames && !namesSimilar(b.name, o.name)) continue;
+              parent[find(j)] = find(i);
+            }
+          }
+        }
+      });
+      const groups = new Map();
+      list.forEach((b, i) => {
+        const r = find(i);
+        if (!groups.has(r)) groups.set(r, []);
+        groups.get(r).push(b);
+      });
+      const out = [];
+      for (const members of groups.values()) {
+        const owners = new Set(members.map((m) => (m.owner === null || m.owner === undefined ? `b${m.id}` : `u${m.owner}`)));
+        if (owners.size < minCount) continue;
+        const freq = new Map();
+        for (const m of members) {
+          const k = m.name.trim().toLowerCase();
+          freq.set(k, { n: ((freq.get(k) || {}).n || 0) + 1, name: m.name.trim() });
+        }
+        // Most common name; on a tie the longest, which is usually the most descriptive.
+        const best = [...freq.values()].sort((a, b) => b.n - a.n || b.name.length - a.name.length)[0];
+        out.push({
+          cat: members[0].cat,
+          name: best.name,
+          lat: members.reduce((s, m) => s + m.lat, 0) / members.length,
+          lng: members.reduce((s, m) => s + m.lng, 0) / members.length,
+          count: owners.size,
+          members,
+        });
+      }
+      return out.sort((a, b) => b.count - a.count);
+    }
+
     function toCsv(rows) {
       const esc = (v) => {
         const s = v === null || v === undefined ? '' : String(v);
@@ -509,6 +618,7 @@
       tally, distKm, isCovered, centersNear, gridCoverage, toCsv, mergeDeep, collectSpecs,
       topoFeatures, geojsonToPolys, makeArea, inArea, areaKm2, areaCoverage,
       SITE_CATS, overpassQuery, formatAddress, formatReverse, parseSites, dedupeSites, markBuilt,
+      catFromTypeName, catFromName, nameTokens, namesSimilar, clusterBuildings,
     };
   })();
 
@@ -576,6 +686,7 @@
     sites: {
       cats: { fire: 1, ambulance: 1, police: 1, hospital: 1, coastguard: 1, lifeboat: 1, air: 1, rescue: 1 },
       hideBuilt: true, radius: 500, showOnMap: true,
+      source: 'alliance', groupRadius: 250, minCount: 2, similarNames: true,
     },
     staffScan: { delay: 350, onlyMatched: false, maxAgeHours: 24 },
     presets: {},
@@ -1310,7 +1421,7 @@
   /* ---------------- real-world sites (OpenStreetMap) ---------------- */
 
   const OVERPASS_URLS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
-  const sites = { list: [], loading: false, error: '', fetchedAt: null };
+  const sites = { list: [], loading: false, error: '', fetchedAt: null, diag: '', source: '' };
   const addrJob = { running: false, abort: false, done: 0, total: 0 };
   let sitePin = null;
   const siteCat = (k) => CORE.SITE_CATS.find((c) => c.key === k);
@@ -1350,10 +1461,105 @@
     if (cfg.ui.tab === 'sites') renderBody();
     try {
       const res = await overpass(CORE.overpassQuery(bbox, keys));
-      sites.list = CORE.dedupeSites(CORE.parseSites(res.elements, keys))
+      const elements = (res && res.elements) || [];
+      // Overpass reports timeouts and overload as a "remark" with an HTTP 200 and no results.
+      if (res && res.remark && !elements.length) throw new Error(`OpenStreetMap couldn’t finish the search: ${res.remark}`);
+      const parsed = CORE.parseSites(elements, keys);
+      const merged = CORE.dedupeSites(parsed);
+      sites.list = merged
         .map((x) => ({ ...x, area: (sel.find((a) => CORE.inArea(x.lat, x.lng, a)) || {}).name }))
         .filter((x) => x.area)
         .sort((a, b) => a.area.localeCompare(b.area) || a.name.localeCompare(b.name));
+      sites.diag = `OpenStreetMap returned ${elements.length} results in the search box around your areas → ${parsed.length} of the chosen types`
+        + ` → ${merged.length} after merging duplicates → ${sites.list.length} inside your areas.`
+        + (res && res.remark ? ` Warning from OpenStreetMap: ${res.remark}` : '');
+      sites.source = 'osm';
+      sites.fetchedAt = new Date();
+      markSitesBuilt();
+    } catch (e) {
+      sites.error = e.message;
+    }
+    sites.loading = false;
+    drawSites();
+    if (cfg.ui.tab === 'sites') renderBody();
+  }
+
+  const stripHtml = (t) => String(t || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+  /** Buildings on the map that aren't yours: /api/alliance_buildings plus any building markers not in your list. */
+  async function collectOtherBuildings() {
+    const mine = new Set(index.map((r) => r.id));
+    const out = new Map();
+    const diag = { api: 0, markers: 0, apiError: '' };
+    try {
+      const j = await getJSON('/api/alliance_buildings');
+      for (const b of Array.isArray(j) ? j : (j && j.result) || []) {
+        const id = Number(b.id);
+        if (mine.has(id) || !Number.isFinite(Number(b.latitude))) continue;
+        diag.api++;
+        out.set(id, {
+          id, name: String(b.caption || ''), lat: Number(b.latitude), lng: Number(b.longitude),
+          type: b.building_type, owner: b.user_id ?? null,
+        });
+      }
+    } catch (e) {
+      diag.apiError = e.message;
+    }
+    const markers = [];
+    map.eachLayer((l) => {
+      const id = Number(l.building_id ?? (l.options && l.options.building_id));
+      if (Number.isFinite(id) && l.getLatLng) markers.push([id, l]);
+    });
+    // Other players' markers carry no type, but the icon for a type is the same for everyone: learn it from yours.
+    const iconUrl = (l) => l.options && l.options.icon && l.options.icon.options && l.options.icon.options.iconUrl;
+    const iconType = new Map();
+    for (const [id, l] of markers) if (byId.has(id) && iconUrl(l)) iconType.set(iconUrl(l), byId.get(id).type);
+    for (const [id, l] of markers) {
+      if (mine.has(id) || out.has(id)) continue;
+      diag.markers++;
+      const ll = l.getLatLng();
+      const tip = l.getTooltip && l.getTooltip();
+      out.set(id, {
+        id,
+        name: stripHtml((l.options && l.options.title) || (tip && tip.getContent && tip.getContent()) || ''),
+        lat: ll.lat,
+        lng: ll.lng,
+        type: l.building_type ?? (iconType.has(iconUrl(l)) ? iconType.get(iconUrl(l)) : null),
+        owner: l.user_id ?? null,
+      });
+    }
+    return { list: [...out.values()], diag };
+  }
+
+  async function findAllianceSites() {
+    const sel = selectedAreas();
+    const keys = siteKeys();
+    if (!sel.length || !keys.length || sites.loading) return;
+    Object.assign(sites, { loading: true, error: '' });
+    if (cfg.ui.tab === 'sites') renderBody();
+    try {
+      const { list, diag } = await collectOtherBuildings();
+      const typed = list.map((b) => ({ ...b, cat: CORE.catFromTypeName(meta.b[String(b.type)]) || CORE.catFromName(b.name) }));
+      const inAreas = typed.filter((b) => b.cat && keys.includes(b.cat) && sel.some((a) => CORE.inArea(b.lat, b.lng, a)));
+      const groups = CORE.clusterBuildings(inAreas, {
+        radiusM: Math.max(10, Number(cfg.sites.groupRadius) || 250),
+        minCount: Math.max(1, Number(cfg.sites.minCount) || 2),
+        requireSimilarNames: !!cfg.sites.similarNames,
+      });
+      sites.list = groups
+        .map((g) => ({
+          id: `alliance/${g.members.map((m) => m.id).sort((a, b) => a - b)[0]}`,
+          cat: g.cat, name: g.name, named: true, lat: g.lat, lng: g.lng, address: '',
+          count: g.count, members: g.members.map((m) => m.name),
+          area: (sel.find((a) => CORE.inArea(g.lat, g.lng, a)) || {}).name,
+        }))
+        .filter((x) => x.area)
+        .sort((a, b) => b.count - a.count || a.area.localeCompare(b.area) || a.name.localeCompare(b.name));
+      sites.diag = `Found ${list.length} buildings by other players (${diag.api} from the alliance list`
+        + `${diag.apiError ? `, which failed: ${diag.apiError}` : ''}, ${diag.markers} more from the map)`
+        + ` → ${typed.filter((b) => b.cat).length} recognised as an emergency service type → ${inAreas.length} inside your areas`
+        + ` → ${sites.list.length} locations where at least ${Math.max(1, Number(cfg.sites.minCount) || 2)} were built.`;
+      sites.source = 'alliance';
       sites.fetchedAt = new Date();
       markSitesBuilt();
     } catch (e) {
@@ -1410,7 +1616,8 @@
     return h('div', { class: 'mcmf-pop' },
       h('b', null, x.name),
       h('div', { class: 'mcmf-muted' }, cat.label.replace(/s$/, ''), x.aande ? ' · A&E' : '', ` · ${x.area}`),
-      h('div', { class: 'mcmf-pop-row' }, x.address || 'No address in OpenStreetMap', x.nearest ? ' (nearest address)' : ''),
+      h('div', { class: 'mcmf-pop-row' }, x.address || (x.members ? 'No address looked up yet' : 'No address in OpenStreetMap'), x.nearest ? ' (nearest address)' : ''),
+      x.members ? h('div', { class: 'mcmf-pop-row' }, `Built by ${x.count} alliance members: ${x.members.join(', ')}`) : null,
       h('div', { class: 'mcmf-pop-row mcmf-muted' }, coords(x)),
       x.built ? h('div', { class: 'mcmf-pop-row' }, `You have “${x.built}” nearby`) : null,
       h('div', { class: 'mcmf-pop-row' }, copyBtn));
@@ -1439,10 +1646,12 @@
   }
 
   function exportSites() {
-    const rows = [['category', 'name', 'address', 'address_source', 'latitude', 'longitude', 'area', 'a_and_e', 'already_built_nearby', 'osm']];
+    const rows = [['category', 'name', 'address', 'address_source', 'latitude', 'longitude', 'area', 'a_and_e', 'already_built_nearby',
+      'alliance_buildings', 'alliance_names', 'osm']];
     for (const x of visibleSites()) {
       rows.push([siteCat(x.cat).label, x.name, x.address, x.address ? (x.nearest ? 'nearest address' : 'OpenStreetMap') : '',
-        x.lat.toFixed(6), x.lng.toFixed(6), x.area, x.aande ? 'yes' : '', x.built || '', `https://www.openstreetmap.org/${x.id}`]);
+        x.lat.toFixed(6), x.lng.toFixed(6), x.area, x.aande ? 'yes' : '', x.built || '',
+        x.count || '', x.members ? x.members.join('; ') : '', x.members ? '' : `https://www.openstreetmap.org/${x.id}`]);
     }
     download(`sites-${HOST}-${new Date().toISOString().slice(0, 10)}.csv`, CORE.toCsv(rows), 'text/csv');
   }
@@ -2137,8 +2346,9 @@
       saveCfg();
       renderBody();
     };
+    const alliance = cs.source === 'alliance';
     bodyEl.append(h('div', { class: 'mcmf-muted' },
-      'Finds real fire, ambulance and police stations, hospitals and other emergency sites inside your selected areas, using OpenStreetMap, and lists the ones you haven’t built yet with their address.'));
+      'Finds real fire, ambulance and police stations, hospitals and other emergency sites inside your selected areas and lists the ones you haven’t built yet.'));
 
     if (!sel.length) {
       bodyEl.append(h('div', { class: 'mcmf-card' },
@@ -2151,6 +2361,20 @@
     for (const x of sites.list) counts[x.cat] = (counts[x.cat] || 0) + 1;
     bodyEl.append(h('div', { class: 'mcmf-card' },
       h('div', null, h('b', null, 'Search in: '), sel.map((a) => a.name).join(', ')),
+      h('div', { class: 'mcmf-row' },
+        h('span', null, 'Source'),
+        select(cs, 'source', [['alliance', 'Where alliance members have built'], ['osm', 'OpenStreetMap']], () => {
+          saveCfg();
+          renderBody();
+        })),
+      alliance ? h('div', { class: 'mcmf-muted' },
+        'Real stations tend to have several alliance members’ buildings of the same type at the same spot, often with similar names. This finds those spots.') : null,
+      alliance ? h('div', { class: 'mcmf-grid2' },
+        h('span', null, 'Within'), h('div', { class: 'mcmf-row' }, numInput(cs, 'groupRadius', { min: 10, step: 50, onChange: saveCfg }), 'metres of each other'),
+        h('span', null, 'At least'), h('div', { class: 'mcmf-row' }, numInput(cs, 'minCount', { min: 1, onChange: saveCfg }), 'members built there')) : null,
+      alliance ? h('label', { class: 'mcmf-row' },
+        h('input', { type: 'checkbox', checked: cs.similarNames, onchange: (e) => { cs.similarNames = e.target.checked; saveCfg(); } }),
+        'Only group buildings with similar names') : null,
       chipGroup(CORE.SITE_CATS.map((c) => ({ key: c.key, label: c.label, count: sites.list.length ? counts[c.key] || 0 : undefined })), cs.cats, {
         tri: false,
         onChange: () => {
@@ -2176,10 +2400,11 @@
         h('input', { type: 'checkbox', checked: cs.showOnMap, onchange: (e) => { cs.showOnMap = e.target.checked; redraw(); } }),
         'Show sites on the map'),
       h('div', { class: 'mcmf-row' },
-        h('button', { class: 'mcmf-btn primary', disabled: sites.loading || !siteKeys().length, onclick: findSites },
-          sites.loading ? 'Searching OpenStreetMap…' : sites.fetchedAt ? 'Search again' : 'Find sites'),
+        h('button', { class: 'mcmf-btn primary', disabled: sites.loading || !siteKeys().length, onclick: alliance ? findAllianceSites : findSites },
+          sites.loading ? 'Searching…' : sites.fetchedAt ? 'Search again' : 'Find sites'),
         sites.fetchedAt ? h('span', { class: 'mcmf-muted' }, `Last search ${sites.fetchedAt.toLocaleTimeString()}`) : null),
-      sites.error ? h('div', { class: 'mcmf-muted mcmf-err' }, sites.error) : null));
+      sites.error ? h('div', { class: 'mcmf-muted mcmf-err' }, sites.error) : null,
+      sites.diag && !sites.error ? h('div', { class: 'mcmf-muted' }, sites.diag) : null));
 
     if (!sites.fetchedAt) return;
 
@@ -2221,13 +2446,17 @@
           }, 'Find address') : null;
           return h('div', { class: 'mcmf-site' },
             h('div', { class: 'mcmf-row' },
-              h('b', { style: 'flex:1' }, x.name, x.aande ? h('span', { class: 'mcmf-badge', style: 'margin-left:6px' }, 'A&E') : null),
+              h('b', { style: 'flex:1' }, x.name,
+                x.aande ? h('span', { class: 'mcmf-badge', style: 'margin-left:6px' }, 'A&E') : null,
+                x.count ? h('span', { class: 'mcmf-badge', style: 'margin-left:6px', title: 'Alliance members who built here' }, `${x.count}×`) : null),
               h('button', { class: 'mcmf-btn', onclick: () => showSite(x) }, 'Show'),
               copyBtn),
             h('div', { class: 'mcmf-stat' },
               x.address ? [x.address, x.nearest ? h('i', null, ' (nearest)') : null]
-                : x.lookupFailed ? 'No address found' : 'No address in OpenStreetMap',
+                : x.lookupFailed ? 'No address found' : x.members ? 'No address yet' : 'No address in OpenStreetMap',
               lookBtn ? [' ', lookBtn] : null),
+            x.members ? h('div', { class: 'mcmf-stat', title: x.members.join('\n') },
+              `Built by ${x.count} members as: ${[...new Set(x.members)].slice(0, 4).join(' · ')}${new Set(x.members).size > 4 ? ' …' : ''}`) : null,
             h('div', { class: 'mcmf-stat' }, `${x.area} · ${coords(x)}`,
               x.built ? h('span', null, ` · you have “${x.built}” nearby`) : null));
         })));
