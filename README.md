@@ -80,6 +80,22 @@ Save named filter sets and apply them later. You can also export all settings to
 
 It runs alongside LSS-Manager. Type names come from the public LSS-Manager API, and the script falls back to type IDs if that API is unreachable.
 
+## Readiness Report
+
+`missionchief-readiness.user.js` is a separate script for occasional use. It adds nothing to the game page: open it from the **Tampermonkey menu → Open readiness report** (or press Alt+Shift+R on the map page). It loads your buildings, vehicles and the game's full mission list, then shows:
+
+- **Overview**: how many mission types you've unlocked, and how many of those your own fleet can fully handle.
+- **Where you're short**: vehicles, staff training and hospital specialties that missions you can already get need, but you don't have enough of. Sorted by how many mission types are affected.
+- **What to build next**: mission types blocked by a single building requirement, e.g. "Police stations +1 → 1 mission".
+- **Weak areas**: for each vehicle requirement, which of your stations don't have enough of it within a distance you set (20 km by default), with a button to show each one on the map.
+- **Housekeeping**: buildings below their personnel goal, vehicles out of service, and stations with no vehicles.
+
+Staff training needs a staff scan. The report shares the scan results with the map filter script, so stations scanned there count here too.
+
+The mission list names requirements with internal codes (for example `firetrucks`), which the report matches to your game's names automatically. **How requirements were matched** shows every match. Click names on or off to fix one, and your changes are saved. **Export** saves the whole report as JSON.
+
+Install it the same way as the map filter, from its raw link.
+
 ### Development
 
 ```sh
