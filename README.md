@@ -94,7 +94,11 @@ Staff training needs a staff scan. The report shares the scan results with the m
 
 The mission list names requirements with internal codes (for example `firetrucks`), which the report matches to your game's names automatically. **How requirements were matched** shows every match. Click names on or off to fix one, and your changes are saved. **Export** saves the whole report as JSON.
 
-Install it the same way as the map filter, from its raw link.
+### Install
+
+With Tampermonkey enabled, open the [raw readiness script](https://raw.githubusercontent.com/TroysterYT/missionchief/main/missionchief-readiness.user.js) and click **Install**, then reload the game.
+
+Each script has its own link. Tampermonkey shows **Update** when a newer version is available, and **Reinstall** when you already have the latest one.
 
 ### Development
 
