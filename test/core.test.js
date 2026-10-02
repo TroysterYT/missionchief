@@ -165,6 +165,50 @@ test('GeoJSON to polys', () => {
   assert.deepEqual(CORE.geojsonToPolys({ type: 'Point', coordinates: [0, 0] }), []);
 });
 
+// MissionChief UK building types (type id → name), as the game / LSS-Manager name them.
+const UK_TYPES = {
+  0: 'Fire station', 1: 'Fire academy', 2: 'Ambulance station', 3: 'Medical Academy', 4: 'Hospital', 5: 'Medical Helicopter station',
+  6: 'Police station', 7: 'Dispatch Center', 8: 'Police training centre', 13: 'Police Aviation', 14: 'Staging area', 16: 'Prison',
+  18: 'Fire station (Small station)', 19: 'Police station (Small station)', 20: 'Ambulance station (Small station)',
+  21: 'Urgent Treatment Center', 22: 'Home Response Location', 23: 'Large complex', 24: 'Small complex', 25: 'HART Base',
+  26: 'Large Police Depot', 27: 'Lifeboat Station', 28: 'Coastguard Rescue Station', 29: 'Search and Rescue College',
+  30: 'Coastal Rescue Heliport', 31: 'Search and Rescue HQ', 32: 'GP Surgery', 33: 'Mountain Rescue Station', 34: 'Recovery Centre',
+  35: 'Bomb Disposal HQ', 36: 'Custody Suite',
+};
+const UK_CATS = CORE.buildSiteCats(UK_TYPES);
+const catBy = (label) => UK_CATS.find((c) => c.label === label);
+
+test('sites: one category per building family, small/large variants grouped', () => {
+  assert.equal(UK_CATS.filter((c) => c.typeIds.length).length, 27); // 31 types; small stations and the two complexes merge
+  assert.equal(UK_CATS.length, 27); // every real-world kind is already covered by a UK family
+  assert.deepEqual(catBy('Fire station').typeIds.sort((a, b) => a - b), [0, 18]);
+  assert.deepEqual(catBy('Police station').typeIds.sort((a, b) => a - b), [6, 19]);
+  assert.deepEqual(catBy('Complex').typeIds.sort((a, b) => a - b), [23, 24]);
+  assert.deepEqual(catBy('Police Depot').typeIds, [26]);
+  assert.equal(catBy('Police Depot').rule, null); // a depot isn't a real police station
+  const withRule = (label) => (catBy(label).rule || {}).key || null;
+  assert.equal(withRule('Fire station'), 'fire');
+  assert.equal(withRule('HART Base'), 'hart');
+  assert.equal(withRule('Medical Helicopter station'), 'medical_air');
+  assert.equal(withRule('Police Aviation'), 'police_air');
+  assert.equal(withRule('Coastal Rescue Heliport'), 'coastal_air');
+  assert.equal(withRule('Coastguard Rescue Station'), 'coastguard');
+  assert.equal(withRule('Urgent Treatment Center'), 'urgent');
+  assert.equal(withRule('GP Surgery'), 'gp');
+  assert.equal(withRule('Custody Suite'), 'custody');
+  assert.equal(withRule('Prison'), 'prison');
+  assert.equal(withRule('Fire academy'), null);
+  assert.equal(withRule('Bomb Disposal HQ'), null);
+  assert.ok(UK_CATS.every((c) => /^#[0-9a-f]{6}$/i.test(c.color)));
+  // Kinds missing from the type names still get a category for recognising buildings by name.
+  const partial = CORE.buildSiteCats({ 0: 'Fire station', 2: 'Ambulance station' });
+  assert.ok(partial.some((c) => c.key === 'police' && !c.typeIds.length));
+  assert.equal(CORE.catOfBuilding({ type: 6, name: 'Dover Police' }, partial), 'police');
+  // Without type names, fall back to the real-world rules.
+  const fallback = CORE.buildSiteCats({});
+  assert.ok(fallback.length >= 10 && fallback.every((c) => c.rule && !c.typeIds.length));
+});
+
 test('sites: parse Overpass elements into categories with addresses', () => {
   const els = [
     { type: 'node', id: 1, lat: 50.4, lon: -4.1, tags: { amenity: 'fire_station', name: 'Plymouth Camels Head', 'addr:housenumber': '1', 'addr:street': 'Ferry Road', 'addr:city': 'Plymouth', 'addr:postcode': 'PL2 1AA' } },
@@ -173,15 +217,22 @@ test('sites: parse Overpass elements into categories with addresses', () => {
     { type: 'node', id: 4, lat: 50.7, lon: -4.4, tags: { shop: 'bakery' } },
     { type: 'node', id: 5, lat: 50.8, lon: -4.5, tags: { emergency: 'lifeboat_station', name: 'Padstow Lifeboat Station' } },
     { type: 'node', id: 6, lat: 50.9, lon: -4.6, tags: { aeroway: 'helipad', name: 'Cornwall Air Ambulance' } },
+    { type: 'node', id: 7, lat: 51.0, lon: -4.7, tags: { amenity: 'police', name: 'Exeter Custody Centre' } },
+    { type: 'node', id: 8, lat: 51.1, lon: -4.8, tags: { amenity: 'police', name: 'Truro Police Station' } },
+    { type: 'node', id: 9, lat: 51.2, lon: -4.9, tags: { emergency: 'ambulance_station', name: 'Exeter HART' } },
+    { type: 'node', id: 10, lat: 51.3, lon: -5.0, tags: { amenity: 'prison', name: 'HMP Exeter' } },
+    { type: 'node', id: 11, lat: 51.4, lon: -5.1, tags: { amenity: 'doctors', name: 'Bude Surgery' } },
+    { type: 'node', id: 12, lat: 51.5, lon: -5.2, tags: { amenity: 'clinic', name: 'Minor Injuries Unit' } },
+    { type: 'node', id: 13, lat: 51.6, lon: -5.3, tags: { aeroway: 'helipad', name: 'Coastguard Helicopter Base' } },
   ];
-  const all = CORE.SITE_CATS.map((c) => c.key);
-  const sites = CORE.parseSites(els, all);
-  assert.deepEqual(sites.map((s) => s.cat), ['fire', 'ambulance', 'hospital', 'lifeboat', 'air']);
+  const sites = CORE.parseSites(els, UK_CATS);
+  assert.deepEqual(sites.map((s) => s.cat), ['fire-station', 'ambulance-station', 'hospital', 'lifeboat-station', 'medical-helicopter-station',
+    'custody-suite', 'police-station', 'hart-base', 'prison', 'gp-surgery', 'urgent-treatment-center', 'coastal-rescue-heliport']);
   assert.equal(sites[0].address, '1 Ferry Road, Plymouth, PL2 1AA');
   assert.equal(sites[1].name, 'Ambulance station (unnamed)');
   assert.equal(sites[1].lat, 50.5);
   assert.equal(sites[2].aande, true);
-  assert.deepEqual(CORE.parseSites(els, ['police']), []);
+  assert.deepEqual(CORE.parseSites(els, [catBy('Prison')]).map((s) => s.name), ['HMP Exeter']);
 });
 
 test('sites: address formatting', () => {
@@ -202,43 +253,44 @@ test('sites: duplicates of one station collapse to the better entry', () => {
   assert.ok(d.includes(s[1]) && !d.includes(s[0]));
 });
 
-test('sites: already built detection by matching building type', () => {
+test('sites: already built means a building of the same family nearby', () => {
   const recs = [
-    { name: 'My Fire Station', type: 0, lat: 50, lng: -4 },
-    { name: 'My Fire Academy', type: 9, lat: 51, lng: -4 },
+    { name: 'My Small Fire Station', type: 18, lat: 50, lng: -4 },
+    { name: 'My Fire Academy', type: 1, lat: 51, lng: -4 },
   ];
-  const names = { 0: 'Fire Station', 9: 'Fire Academy' };
   const sites = [
-    { cat: 'fire', lat: 50.002, lng: -4 }, // ~220 m from my station
-    { cat: 'fire', lat: 51, lng: -4 }, // on top of the academy, which doesn't count
-    { cat: 'police', lat: 50, lng: -4 }, // I own no police station, so a fire station here doesn't count
+    { cat: 'fire-station', lat: 50.002, lng: -4 }, // ~220 m from my small fire station: same family
+    { cat: 'fire-station', lat: 51, lng: -4 }, // on top of the academy, which is another family
+    { cat: 'police-station', lat: 50, lng: -4 }, // I own no police station
+    { cat: 'fire-academy', lat: 51.001, lng: -4 },
   ];
-  CORE.markBuilt(sites, recs, (t) => names[t], 500);
-  assert.deepEqual(sites.map((s) => s.built), ['My Fire Station', null, null]);
-  // Type names unavailable: fall back to any building nearby.
-  CORE.markBuilt(sites, recs, () => '', 500);
-  assert.deepEqual(sites.map((s) => s.built), ['My Fire Station', 'My Fire Academy', 'My Fire Station']);
+  CORE.markBuilt(sites, recs, UK_CATS, 500);
+  assert.deepEqual(sites.map((s) => s.built), ['My Small Fire Station', null, null, 'My Fire Academy']);
+  // Type names unavailable: categories have no type ids, so any building nearby counts.
+  const fb = CORE.buildSiteCats({});
+  const s2 = [{ cat: 'fire', lat: 51, lng: -4 }];
+  CORE.markBuilt(s2, recs, fb, 500);
+  assert.equal(s2[0].built, 'My Fire Academy');
 });
 
 test('sites: overpass query includes only requested categories', () => {
-  const q = CORE.overpassQuery({ south: 49.9, west: -6.4, north: 52.1, east: -1.5 }, ['fire', 'coastguard']);
+  const q = CORE.overpassQuery({ south: 49.9, west: -6.4, north: 52.1, east: -1.5 }, [catBy('Fire station'), catBy('Coastguard Rescue Station'), catBy('Fire academy')]);
   assert.match(q, /"amenity"="fire_station"\]\(49\.9,-6\.4,52\.1,-1\.5\)/);
   assert.match(q, /coast_guard/);
   assert.doesNotMatch(q, /hospital/);
   assert.match(q, /out center tags;$/);
 });
 
-test('alliance: categories from game type names and building names', () => {
-  assert.equal(CORE.catFromTypeName('Fire Station (Small)'), 'fire');
-  assert.equal(CORE.catFromTypeName('Fire Academy'), null);
-  assert.equal(CORE.catFromTypeName('Air Ambulance Station'), 'air');
-  assert.equal(CORE.catFromTypeName('Police Aviation'), 'air');
-  assert.equal(CORE.catFromTypeName('Coastal Rescue Station'), 'coastguard');
-  assert.equal(CORE.catFromName('Truro Fire Station'), 'fire');
-  assert.equal(CORE.catFromName('Cornwall Air Ambulance'), 'air');
-  assert.equal(CORE.catFromName('Falmouth RNLI'), 'lifeboat');
-  assert.equal(CORE.catFromName('Royal Cornwall Hospital'), 'hospital');
-  assert.equal(CORE.catFromName('Bob\'s base'), null);
+test('alliance: buildings sorted into families by type, or by name when the type is unknown', () => {
+  assert.equal(CORE.catOfBuilding({ type: 18, name: 'whatever' }, UK_CATS), 'fire-station');
+  assert.equal(CORE.catOfBuilding({ type: 35, name: 'x' }, UK_CATS), 'bomb-disposal-hq');
+  assert.equal(CORE.catOfBuilding({ type: '25', name: 'x' }, UK_CATS), 'hart-base');
+  assert.equal(CORE.catOfBuilding({ type: null, name: 'Truro Fire Station' }, UK_CATS), 'fire-station');
+  assert.equal(CORE.catOfBuilding({ type: null, name: 'Cornwall Air Ambulance' }, UK_CATS), 'medical-helicopter-station');
+  assert.equal(CORE.catOfBuilding({ type: null, name: 'Falmouth RNLI' }, UK_CATS), 'lifeboat-station');
+  assert.equal(CORE.catOfBuilding({ type: null, name: 'Exeter HART' }, UK_CATS), 'hart-base');
+  assert.equal(CORE.catOfBuilding({ type: null, name: 'Plymouth Recovery Centre' }, UK_CATS), 'recovery-centre');
+  assert.equal(CORE.catOfBuilding({ type: null, name: 'Bob\'s base' }, UK_CATS), null);
 });
 
 test('alliance: name similarity ignores generic words', () => {

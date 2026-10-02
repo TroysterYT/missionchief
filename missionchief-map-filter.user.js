@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Map Filter & Coverage
 // @namespace    https://github.com/TroysterYT/missionchief
-// @version      0.6.0
+// @version      0.7.0
 // @description  Filter your buildings on the map by type, extensions, specializations, vehicles, vehicle status, staff training and more; draw station coverage with gap analysis, and select counties or other areas to plan coverage.
 // @author       TroysterYT
 // @match        https://www.missionchief.com/*
@@ -368,34 +368,110 @@
       return { uncovered, fraction: inside ? covered / inside : 0, inside };
     }
 
-    /* ---- real-world sites from OpenStreetMap ---- */
+    /* ---- site categories: one per building family (small/large variants grouped) ---- */
 
-    // type/notType match the game's building type names, to tell whether a site is already built.
-    const SITE_CATS = [
-      { key: 'fire', label: 'Fire stations', color: '#dc2626', match: (t) => t.amenity === 'fire_station', type: /fire/i, notType: /academy|school|training/i },
-      { key: 'ambulance', label: 'Ambulance stations', color: '#16a34a', match: (t) => t.emergency === 'ambulance_station', type: /ambulance/i, notType: /air|academy|school|training/i },
-      { key: 'police', label: 'Police stations', color: '#2563eb', match: (t) => t.amenity === 'police', type: /police/i, notType: /air|aviation|helicopter|academy|school|training/i },
-      { key: 'hospital', label: 'Hospitals', color: '#db2777', match: (t) => t.amenity === 'hospital', type: /hospital/i },
-      { key: 'coastguard', label: 'Coastguard stations', color: '#0891b2', match: (t) => t.emergency === 'coast_guard' || t.amenity === 'coast_guard', type: /coast/i },
-      { key: 'lifeboat', label: 'Lifeboat stations', color: '#ea580c', match: (t) => t.emergency === 'lifeboat_station', type: /lifeboat|rnli|boat/i },
-      { key: 'air', label: 'Air ambulance & police helicopter bases', color: '#7c3aed', match: (t) => /^(helipad|heliport)$/.test(t.aeroway || ''), type: /air|aviation|helicopter/i },
-      { key: 'rescue', label: 'Mountain & cave rescue', color: '#a16207', match: (t) => t.emergency === 'mountain_rescue', type: /rescue/i, notType: /boat|water/i },
+    const isHeli = (t) => /^(helipad|heliport)$/.test(t.aeroway || '');
+    // Real-world equivalents in OpenStreetMap, most specific first. `family` matches the game's building type name;
+    // `name` recognises an alliance building by its player-given name when its type is unknown.
+    const OSM_RULES = [
+      { key: 'custody', label: 'Custody suites', family: /custody/i, name: /custody/i, color: '#475569',
+        match: (t) => t.amenity === 'police' && /custody/i.test(t.name || ''),
+        query: (b) => [`nwr["amenity"="police"]["name"~"custody",i]${b};`] },
+      { key: 'police_air', label: 'Police helicopter bases', family: /police aviation|police helicopter/i, name: /police aviation|police helicopter|npas/i, color: '#1e40af',
+        match: (t) => isHeli(t) && /police|npas/i.test(t.name || ''),
+        query: (b) => [`nwr["aeroway"~"^(helipad|heliport)$"]["name"~"police|npas",i]${b};`] },
+      { key: 'coastal_air', label: 'Coastguard helicopter bases', family: /coastal rescue heliport|coast ?guard (rescue )?heli/i, name: /coast ?guard heli|rescue heliport/i, color: '#0e7490',
+        match: (t) => isHeli(t) && /coast ?guard|search and rescue/i.test(t.name || ''),
+        query: (b) => [`nwr["aeroway"~"^(helipad|heliport)$"]["name"~"coast ?guard|search and rescue",i]${b};`] },
+      { key: 'medical_air', label: 'Air ambulance bases', family: /medical helicopter|air ambulance|hems/i, name: /air ambulance|hems|medical heli/i, color: '#7c3aed',
+        match: (t) => isHeli(t) && /air ambulance|hems/i.test(t.name || ''),
+        query: (b) => [`nwr["aeroway"~"^(helipad|heliport)$"]["name"~"air ambulance|hems",i]${b};`] },
+      { key: 'hart', label: 'HART bases', family: /\bhart\b/i, name: /\bHART\b|hazardous area response/, color: '#166534',
+        match: (t) => t.emergency === 'ambulance_station' && /\bHART\b|hazardous area response/i.test(t.name || ''),
+        query: (b) => [`nwr["emergency"="ambulance_station"]["name"~"HART|Hazardous Area Response"]${b};`] },
+      { key: 'ambulance', label: 'Ambulance stations', family: /^(ambulance|ems) station/i, name: /ambulance/i, color: '#16a34a',
+        match: (t) => t.emergency === 'ambulance_station', query: (b) => [`nwr["emergency"="ambulance_station"]${b};`] },
+      { key: 'fire', label: 'Fire stations', family: /^fire station/i, name: /\bfire\b|\bfs\b/i, color: '#dc2626',
+        match: (t) => t.amenity === 'fire_station', query: (b) => [`nwr["amenity"="fire_station"]${b};`] },
+      { key: 'police', label: 'Police stations', family: /^police station|sheriff/i, name: /police|constabulary|sheriff/i, color: '#2563eb',
+        match: (t) => t.amenity === 'police', query: (b) => [`nwr["amenity"="police"]${b};`] },
+      { key: 'urgent', label: 'Urgent treatment centres', family: /urgent (treatment|care)/i, name: /urgent (treatment|care)|minor injur/i, color: '#be185d',
+        match: (t) => /urgent (treatment|care)|minor injur/i.test(t.name || '') && (/^(clinic|hospital)$/.test(t.amenity || '') || /^(clinic|hospital)$/.test(t.healthcare || '')),
+        query: (b) => [`nwr["amenity"~"^(clinic|hospital)$"]["name"~"urgent (treatment|care)|minor injur",i]${b};`,
+          `nwr["healthcare"~"^(clinic|hospital)$"]["name"~"urgent (treatment|care)|minor injur",i]${b};`] },
+      { key: 'hospital', label: 'Hospitals', family: /^hospital/i, name: /hospital|infirmary/i, color: '#db2777',
+        match: (t) => t.amenity === 'hospital', query: (b) => [`nwr["amenity"="hospital"]${b};`] },
+      { key: 'gp', label: 'GP surgeries', family: /gp surgery|general practi|doctor/i, name: /surgery|medical (practice|centre)|health centre|\bGP\b/i, color: '#9d174d',
+        match: (t) => t.amenity === 'doctors' || t.healthcare === 'doctor', query: (b) => [`nwr["amenity"="doctors"]${b};`] },
+      { key: 'prison', label: 'Prisons', family: /prison|jail/i, name: /prison|\bHMP\b|jail/i, color: '#334155',
+        match: (t) => t.amenity === 'prison', query: (b) => [`nwr["amenity"="prison"]${b};`] },
+      { key: 'coastguard', label: 'Coastguard stations', family: /coast ?guard/i, name: /coast ?guard/i, color: '#0891b2',
+        match: (t) => t.emergency === 'coast_guard' || t.amenity === 'coast_guard',
+        query: (b) => [`nwr["emergency"="coast_guard"]${b};`, `nwr["amenity"="coast_guard"]${b};`] },
+      { key: 'lifeboat', label: 'Lifeboat stations', family: /lifeboat/i, name: /lifeboat|rnli/i, color: '#ea580c',
+        match: (t) => t.emergency === 'lifeboat_station', query: (b) => [`nwr["emergency"="lifeboat_station"]${b};`] },
+      { key: 'mountain', label: 'Mountain & cave rescue', family: /mountain rescue|cave rescue/i, name: /mountain rescue|cave rescue/i, color: '#a16207',
+        match: (t) => t.emergency === 'mountain_rescue', query: (b) => [`nwr["emergency"="mountain_rescue"]${b};`] },
     ];
+    const OTHER_COLORS = ['#64748b', '#0f766e', '#a21caf', '#b45309', '#4d7c0f', '#9333ea', '#c2410c', '#0369a1', '#be123c', '#57534e'];
 
-    /** Overpass QL for the given categories inside bbox {south, west, north, east}. */
-    function overpassQuery(bbox, keys) {
+    /** "Fire station (Small station)" and "Large Police Depot" → family label "Fire station", "Police Depot". */
+    function familyOf(typeName) {
+      const label = String(typeName || '').replace(/\s*\((small|large)( station)?\)/gi, '').replace(/^(small|large)\s+/i, '')
+        .replace(/\s+/g, ' ').trim();
+      return { key: label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''), label: label.charAt(0).toUpperCase() + label.slice(1) };
+    }
+
+    /**
+     * One category per building family from the game's type names {typeId: name}:
+     * [{key, label, typeIds, rule (OSM rule or null), color, nameRe}]. Families with an OSM rule come first.
+     * Without type names, falls back to the OSM rules alone (typeIds empty: any building counts as built).
+     */
+    function buildSiteCats(typeNames) {
+      const fams = new Map();
+      for (const [id, n] of Object.entries(typeNames || {})) {
+        if (!n) continue;
+        const f = familyOf(n);
+        if (!f.key) continue;
+        if (!fams.has(f.key)) fams.set(f.key, { key: f.key, label: f.label, typeIds: [] });
+        fams.get(f.key).typeIds.push(Number(id));
+      }
+      if (!fams.size) {
+        return OSM_RULES.map((r) => ({ key: r.key, label: r.label, typeIds: [], rule: r, color: r.color, nameRe: r.name }));
+      }
+      const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const cats = [...fams.values()].map((c) => {
+        const rule = OSM_RULES.find((r) => r.family.test(c.label)) || null;
+        return { ...c, rule, color: rule ? rule.color : null, nameRe: rule ? rule.name : new RegExp(esc(c.label), 'i') };
+      });
+      // Kinds the type names don't cover (e.g. a type the name list doesn't know yet) still get a category, so
+      // buildings can be recognised by name; with no type ids, any building nearby counts as already built.
+      for (const r of OSM_RULES) {
+        if (!cats.some((c) => c.rule === r)) cats.push({ key: r.key, label: r.label, typeIds: [], rule: r, color: r.color, nameRe: r.name });
+      }
+      const rank = (c) => (c.rule ? OSM_RULES.indexOf(c.rule) : OSM_RULES.length);
+      cats.sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
+      let k = 0;
+      for (const c of cats) if (!c.color) c.color = OTHER_COLORS[k++ % OTHER_COLORS.length];
+      return cats;
+    }
+
+    /** Category key for a building {type, name}: by its type when known, else by its name. */
+    function catOfBuilding(b, cats) {
+      const t = b.type === null || b.type === undefined || b.type === '' ? null : Number(b.type);
+      if (t !== null && Number.isFinite(t)) {
+        const c = cats.find((x) => x.typeIds.includes(t));
+        if (c) return c.key;
+      }
+      const byName = cats.find((x) => x.nameRe && x.nameRe.test(b.name || ''));
+      return byName ? byName.key : null;
+    }
+
+    /** Overpass QL for the categories (those with an OSM rule) inside bbox {south, west, north, east}. */
+    function overpassQuery(bbox, cats) {
       const b = `(${bbox.south},${bbox.west},${bbox.north},${bbox.east})`;
-      const parts = {
-        fire: [`nwr["amenity"="fire_station"]${b};`],
-        ambulance: [`nwr["emergency"="ambulance_station"]${b};`],
-        police: [`nwr["amenity"="police"]${b};`],
-        hospital: [`nwr["amenity"="hospital"]${b};`],
-        coastguard: [`nwr["emergency"="coast_guard"]${b};`, `nwr["amenity"="coast_guard"]${b};`],
-        lifeboat: [`nwr["emergency"="lifeboat_station"]${b};`],
-        air: [`nwr["aeroway"~"^(helipad|heliport)$"]["name"~"air ambulance|police|npas",i]${b};`],
-        rescue: [`nwr["emergency"="mountain_rescue"]${b};`],
-      };
-      return `[out:json][timeout:90];(${keys.flatMap((k) => parts[k] || []).join('')});out center tags;`;
+      const parts = [...new Set(cats.filter((c) => c.rule).flatMap((c) => c.rule.query(b)))];
+      return `[out:json][timeout:90];(${parts.join('')});out center tags;`;
     }
 
     function joinAddress(parts) {
@@ -412,12 +488,12 @@
     }
 
     /** Overpass elements → sites [{id, cat, name, lat, lng, address, aande}], one per element, first matching category. */
-    function parseSites(elements, keys) {
-      const cats = SITE_CATS.filter((c) => keys.includes(c.key));
+    function parseSites(elements, cats) {
+      const withRule = cats.filter((c) => c.rule);
       const out = [];
       for (const el of elements || []) {
         const t = el.tags || {};
-        const cat = cats.find((c) => c.match(t));
+        const cat = withRule.find((c) => c.rule.match(t));
         if (!cat) continue;
         const lat = el.lat ?? (el.center && el.center.lat);
         const lng = el.lon ?? (el.center && el.center.lon);
@@ -425,12 +501,12 @@
         out.push({
           id: `${el.type}/${el.id}`,
           cat: cat.key,
-          name: t.name || t.official_name || t.operator || `${cat.label.replace(/s$/, '')} (unnamed)`,
+          name: t.name || t.official_name || t.operator || `${cat.label} (unnamed)`,
           named: !!(t.name || t.official_name),
           lat,
           lng,
           address: formatAddress(t),
-          aande: cat.key === 'hospital' && t.emergency === 'yes',
+          aande: cat.rule.key === 'hospital' && t.emergency === 'yes',
         });
       }
       return out;
@@ -448,21 +524,14 @@
     }
 
     /**
-     * Set site.built to the name of your nearest matching building within maxM metres, or null.
-     * recs: building records; typeName(typeId) gives the game's type name used to match categories.
+     * Set site.built to the name of your nearest building of the site's category within maxM metres, or null.
+     * A category without type ids (type names unavailable) compares against every building.
      */
-    function markBuilt(sites, recs, typeName, maxM) {
-      // Without building type names (type-name lookup failed) we can't tell types apart, so any building counts.
-      const namesKnown = recs.some((r) => typeName(r.type));
-      const byCat = {};
-      for (const c of SITE_CATS) {
-        byCat[c.key] = !namesKnown ? recs : recs.filter((r) => {
-          const n = typeName(r.type) || '';
-          return c.type.test(n) && !(c.notType && c.notType.test(n));
-        });
-      }
+    function markBuilt(sites, recs, cats, maxM) {
+      const pools = {};
+      for (const c of cats) pools[c.key] = c.typeIds.length ? recs.filter((r) => c.typeIds.includes(Number(r.type))) : recs;
       for (const s of sites) {
-        const pool = byCat[s.cat];
+        const pool = pools[s.cat] || [];
         let best = null;
         let bestD = Infinity;
         for (const r of pool) {
@@ -479,30 +548,8 @@
 
     /* ---- sites from alliance members' buildings ---- */
 
-    /** Site category from a game building type name, e.g. "Fire Station (Small)" → 'fire'. */
-    function catFromTypeName(n) {
-      if (!n) return null;
-      const c = SITE_CATS.find((x) => x.type.test(n) && !(x.notType && x.notType.test(n)));
-      return c ? c.key : null;
-    }
-
-    // Order matters: "Air Ambulance" is 'air', not 'ambulance'.
-    const NAME_CATS = [
-      ['air', /air ambulance|helicopter|\bheli|npas|police aviation/i],
-      ['lifeboat', /lifeboat|rnli/i],
-      ['coastguard', /coast ?guard/i],
-      ['rescue', /mountain rescue|cave rescue|search and rescue/i],
-      ['hospital', /hospital|infirmary|\bA ?& ?E\b/i],
-      ['ambulance', /ambulance/i],
-      ['police', /police|constabulary/i],
-      ['fire', /\bfire\b/i],
-    ];
-    function catFromName(name) {
-      const hit = NAME_CATS.find(([, re]) => re.test(name || ''));
-      return hit ? hit[0] : null;
-    }
-
     const NAME_STOP = new Set(('fire station stations ambulance police hospital rescue service services community the and of '
+      + 'hq base depot suite surgery heliport college academy prison custody lifeboat '
       + 'fs as ps ems hq small large big new old base centre center general county city district emergency air lifeboat rnli '
       + 'coastguard coast guard mountain cave team unit standby post nhs trust fire-station').split(' '));
 
@@ -610,8 +657,8 @@
       FMS_LABELS, buildIndex, matchChips, matches, filtersActive, defaultFilters, countActive,
       tally, distKm, isCovered, centersNear, gridCoverage, toCsv, mergeDeep, collectSpecs,
       topoFeatures, geojsonToPolys, makeArea, inArea, areaKm2, areaCoverage,
-      SITE_CATS, overpassQuery, formatAddress, parseSites, dedupeSites, markBuilt,
-      catFromTypeName, catFromName, nameTokens, namesSimilar, clusterBuildings,
+      OSM_RULES, familyOf, buildSiteCats, catOfBuilding, overpassQuery, formatAddress, parseSites, dedupeSites, markBuilt,
+      nameTokens, namesSimilar, clusterBuildings,
     };
   })();
 
@@ -677,7 +724,7 @@
     },
     areas: { visible: true, state: '', ukRegion: 'england', pick: false, color: '#8b5cf6', opacity: 0.1, labels: true, selected: {} },
     sites: {
-      cats: { fire: 1, ambulance: 1, police: 1, hospital: 1, coastguard: 1, lifeboat: 1, air: 1, rescue: 1 },
+      off: {}, // building families you've switched off; everything else is searched
       hideBuilt: true, radius: 500, showOnMap: true,
       source: 'alliance', groupRadius: 250, minCount: 2, similarNames: true, scanZoom: 13,
     },
@@ -1417,8 +1464,20 @@
   const OVERPASS_URLS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
   const sites = { list: [], loading: false, error: '', fetchedAt: null, diag: '', source: '' };
   let sitePin = null;
-  const siteCat = (k) => CORE.SITE_CATS.find((c) => c.key === k);
-  const siteKeys = () => Object.keys(cfg.sites.cats).filter((k) => cfg.sites.cats[k] === 1);
+  // Categories follow the game's building types (from the type names), so they're rebuilt when those change.
+  let catsFor = null;
+  let catsCache = [];
+  const siteCats = () => {
+    if (catsFor !== meta.b) {
+      catsFor = meta.b;
+      catsCache = CORE.buildSiteCats(meta.b);
+    }
+    return catsCache;
+  };
+  const siteCat = (k) => siteCats().find((c) => c.key === k) || { key: k, label: k, color: '#64748b', typeIds: [] };
+  /** Selected category keys; OpenStreetMap only knows the families that have a real-world equivalent. */
+  const siteKeys = (source = cfg.sites.source) => siteCats()
+    .filter((c) => !cfg.sites.off[c.key] && (source !== 'osm' || c.rule)).map((c) => c.key);
   const visibleSites = () => {
     const keys = siteKeys();
     return sites.list.filter((x) => keys.includes(x.cat) && !(cfg.sites.hideBuilt && x.built));
@@ -1439,12 +1498,13 @@
   }
 
   function markSitesBuilt() {
-    CORE.markBuilt(sites.list, index, (t) => meta.b[String(t)] || '', Math.max(0, Number(cfg.sites.radius) || 0));
+    CORE.markBuilt(sites.list, index, siteCats(), Math.max(0, Number(cfg.sites.radius) || 0));
   }
 
   async function findSites() {
     const sel = selectedAreas();
-    const keys = siteKeys();
+    const keys = siteKeys('osm');
+    const cats = siteCats().filter((c) => keys.includes(c.key));
     if (!sel.length || !keys.length || sites.loading) return;
     const bbox = sel.reduce((b, a) => ({
       south: Math.min(b.south, a.bbox.south), west: Math.min(b.west, a.bbox.west),
@@ -1453,11 +1513,11 @@
     Object.assign(sites, { loading: true, error: '' });
     if (cfg.ui.tab === 'sites') renderBody();
     try {
-      const res = await overpass(CORE.overpassQuery(bbox, keys));
+      const res = await overpass(CORE.overpassQuery(bbox, cats));
       const elements = (res && res.elements) || [];
       // Overpass reports timeouts and overload as a "remark" with an HTTP 200 and no results.
       if (res && res.remark && !elements.length) throw new Error(`OpenStreetMap couldn’t finish the search: ${res.remark}`);
-      const parsed = CORE.parseSites(elements, keys);
+      const parsed = CORE.parseSites(elements, cats);
       const merged = CORE.dedupeSites(parsed);
       sites.list = merged
         .map((x) => ({ ...x, area: (sel.find((a) => CORE.inArea(x.lat, x.lng, a)) || {}).name }))
@@ -1638,13 +1698,14 @@
 
   async function findAllianceSites() {
     const sel = selectedAreas();
-    const keys = siteKeys();
+    const keys = siteKeys('alliance');
     if (!sel.length || !keys.length || sites.loading) return;
     Object.assign(sites, { loading: true, error: '' });
     if (cfg.ui.tab === 'sites') renderBody();
     try {
       const { list, diag } = await collectOtherBuildings();
-      const typed = list.map((b) => ({ ...b, cat: CORE.catFromTypeName(meta.b[String(b.type)]) || CORE.catFromName(b.name) }));
+      const cats = siteCats();
+      const typed = list.map((b) => ({ ...b, cat: CORE.catOfBuilding(b, cats) }));
       const inAreas = typed.filter((b) => b.cat && keys.includes(b.cat) && sel.some((a) => CORE.inArea(b.lat, b.lng, a)));
       const groups = CORE.clusterBuildings(inAreas, {
         radiusM: Math.max(10, Number(cfg.sites.groupRadius) || 250),
@@ -1662,7 +1723,7 @@
         .sort((a, b) => b.count - a.count || a.area.localeCompare(b.area) || a.name.localeCompare(b.name));
       sites.diag = `Found ${list.length} buildings by other players (${diag.api} from the alliance list`
         + `${diag.apiError ? `, which failed: ${diag.apiError}` : ''}, ${diag.map} more collected from the map)`
-        + ` → ${typed.filter((b) => b.cat).length} recognised as an emergency service type → ${inAreas.length} inside your areas`
+        + ` → ${typed.filter((b) => b.cat).length} recognised as a building type → ${inAreas.length} inside your areas`
         + ` → ${sites.list.length} locations where at least ${Math.max(1, Number(cfg.sites.minCount) || 2)} were built.`;
       sites.source = 'alliance';
       sites.fetchedAt = new Date();
@@ -2470,6 +2531,10 @@
 
     const counts = {};
     for (const x of sites.list) counts[x.cat] = (counts[x.cat] || 0) + 1;
+    const shownCats = siteCats().filter((c) => alliance || c.rule);
+    const hiddenForOsm = siteCats().length - shownCats.length;
+    const onState = {};
+    for (const c of shownCats) if (!cs.off[c.key]) onState[c.key] = 1;
     bodyEl.append(h('div', { class: 'mcmf-card' },
       h('div', null, h('b', null, 'Search in: '), sel.map((a) => a.name).join(', ')),
       h('div', { class: 'mcmf-row' },
@@ -2487,14 +2552,22 @@
         h('input', { type: 'checkbox', checked: cs.similarNames, onchange: (e) => { cs.similarNames = e.target.checked; saveCfg(); } }),
         'Only group buildings with similar names') : null,
       alliance ? allianceScanBox() : null,
-      chipGroup(CORE.SITE_CATS.map((c) => ({ key: c.key, label: c.label, count: sites.list.length ? counts[c.key] || 0 : undefined })), cs.cats, {
+      h('div', { class: 'mcmf-row' },
+        h('b', { style: 'flex:1' }, 'Building types'),
+        h('button', { class: 'mcmf-btn', onclick: () => { for (const c of shownCats) delete cs.off[c.key]; redraw(); } }, 'All'),
+        h('button', { class: 'mcmf-btn', onclick: () => { for (const c of shownCats) cs.off[c.key] = 1; redraw(); } }, 'None')),
+      chipGroup(shownCats.map((c) => ({ key: c.key, label: c.label, count: sites.list.length ? counts[c.key] || 0 : undefined })), onState, {
         tri: false,
         onChange: () => {
-          drawSites();
-          saveCfg();
-          renderBody();
+          for (const c of shownCats) {
+            if (onState[c.key] === 1) delete cs.off[c.key];
+            else cs.off[c.key] = 1;
+          }
+          redraw();
         },
       }),
+      !alliance && hiddenForOsm ? h('div', { class: 'mcmf-muted' },
+        `${hiddenForOsm} building types (academies, dispatch centres and similar) have no real-world equivalent in OpenStreetMap; switch the source to alliance members to search them.`) : null,
       h('label', { class: 'mcmf-row' },
         h('input', { type: 'checkbox', checked: cs.hideBuilt, onchange: (e) => { cs.hideBuilt = e.target.checked; redraw(); } }),
         'Hide sites I already have a building within'),
@@ -2529,7 +2602,7 @@
         h('button', { class: 'mcmf-btn', disabled: !vis.length, onclick: exportSites }, 'Export sites CSV')),
       h('div', { class: 'mcmf-muted' }, 'Show zooms the map onto the site and rings it, so you can place your building on the ring.')));
 
-    for (const c of CORE.SITE_CATS) {
+    for (const c of siteCats()) {
       const items = vis.filter((x) => x.cat === c.key);
       if (!items.length) continue;
       if (cfg.ui.sections[`site-${c.key}`] === undefined) cfg.ui.sections[`site-${c.key}`] = true;
