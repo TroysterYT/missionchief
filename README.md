@@ -53,14 +53,12 @@ For each selected area you see its size, the buildings inside it by type, the mi
 
 ### Sites
 
-Finds emergency service sites to build inside your selected areas. There are two sources:
+Finds sites to build inside your selected areas, for every building type in the game. Categories come from the game's own building types, with small and large versions grouped ("Fire station (Small station)" counts as a fire station). Tick the types you want, or use All/None. There are two sources:
 
 - **Where alliance members have built** (default): looks at other players' buildings and flags spots where several members built the same kind of building close together, optionally only when the names are similar. Those are very likely real stations. You can set the distance, how many members must have built there, and whether names must be similar.
 
   The game only loads other players' buildings near where you're looking, and more as you zoom in. The script remembers every one that appears while you browse (saved in your browser), and **Scan my areas** moves the map across your selected areas at a zoom you choose to load them all, then puts the map back. Zoom in until all buildings show, press **Use current**, then scan.
-- **OpenStreetMap**: real sites from the map data. The tab shows how many results came back at each step, and a clear message when OpenStreetMap is too busy to answer.
-
-The OpenStreetMap source covers: fire, ambulance and police stations, hospitals (A&E marked), coastguard and lifeboat stations, air ambulance and police helicopter bases, and mountain and cave rescue. Sites where you already have a building of the matching type nearby (500 m by default) are hidden, so the list shows what's left to build.
+- **OpenStreetMap**: real sites from the map data. This only covers building types that exist in the real world: fire, ambulance and police stations, HART bases, custody suites, hospitals, urgent treatment centres, GP surgeries, prisons, coastguard, lifeboat and mountain rescue stations, and air ambulance, police and coastguard helicopter bases. Academies, dispatch centres and similar game-only types are searched with the alliance source. The tab shows how many results came back at each step, and a clear message when OpenStreetMap is too busy to answer.
 
 Each site is a dot on the map. **Show** zooms onto the site and rings it so you can place your building there. You can export the list to CSV.
 
